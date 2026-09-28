@@ -1,0 +1,27 @@
+{
+  "id": "blocked_aisle",
+  "name": "Blocked Aisle",
+  "description": "A temporary obstacle forces replanning.",
+  "robots": [
+    {
+      "id": "R1",
+      "x": 2.5,
+      "y": 3.5
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "start": [2, 3],
+      "destination": [17, 3],
+      "assigned_robot": "R1"
+    }
+  ],
+  "obstacles": [
+    {
+      "x": 9,
+      "y": 3,
+      "temporary": true
+    }
+  ]
+}

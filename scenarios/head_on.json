@@ -1,0 +1,34 @@
+{
+  "id": "head_on",
+  "name": "Head-on",
+  "description": "Two robots approach each other in the same aisle.",
+  "robots": [
+    {
+      "id": "R1",
+      "x": 2.5,
+      "y": 3.5,
+      "battery": 100
+    },
+    {
+      "id": "R2",
+      "x": 17.5,
+      "y": 3.5,
+      "battery": 100
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "start": [2, 3],
+      "destination": [17, 3],
+      "assigned_robot": "R1"
+    },
+    {
+      "id": "T002",
+      "start": [17, 3],
+      "destination": [2, 3],
+      "assigned_robot": "R2"
+    }
+  ],
+  "obstacles": []
+}

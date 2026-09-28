@@ -1,0 +1,36 @@
+{
+  "id": "t_junction",
+  "name": "T Junction",
+  "description": "Two robots approach a shared junction.",
+  "robots": [
+    {
+      "id": "R1",
+      "x": 5.5,
+      "y": 3.5
+    },
+    {
+      "id": "R2",
+      "x": 10.5,
+      "y": 8.5
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "start": [5, 3],
+      "destination": [12, 3],
+      "assigned_robot": "R1"
+    },
+    {
+      "id": "T002",
+      "start": [10, 8],
+      "destination": [10, 2],
+      "assigned_robot": "R2"
+    }
+  ],
+  "obstacles": [
+    {"x": 8, "y": 4},
+    {"x": 9, "y": 4},
+    {"x": 11, "y": 4}
+  ]
+}

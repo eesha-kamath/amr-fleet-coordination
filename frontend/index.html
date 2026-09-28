@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARCNET Fleet Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><i></i>ARCNET</div>
+  <nav>
+    <button class="tab on" data-tab="monitor">Monitor</button>
+    <button class="tab" data-tab="tasks">Tasks</button>
+    <button class="tab" data-tab="validation">Validation</button>
+  </nav>
+  <div class="ctl">
+    <span id="pill" class="pill">Connecting</span>
+    <button id="bStart" class="go">Start</button>
+    <button id="bStop">Stop</button>
+    <button id="bReset">Reset</button>
+  </div>
+</header>
+
+<main id="monitor" class="page on">
+  <aside>
+    <section class="card"><h2>Missions</h2><div id="missions"></div></section>
+    <section class="card">
+      <h2>Tools</h2>
+      <div class="tools">
+        <button class="tool on" data-tool="view">Watch</button>
+        <button class="tool" data-tool="dispatch">Send robot</button>
+        <button class="tool" data-tool="block">Block cell</button>
+        <button class="tool" data-tool="wifi">Dead zone</button>
+        <button class="tool" data-tool="kill">Fail robot</button>
+      </div>
+      <p id="hint" class="mute"></p>
+    </section>
+  </aside>
+
+  <div class="center">
+    <div class="hud">
+      <div><b id="hTime">0.0</b><span>seconds</span></div>
+      <div><b id="hTasks">0/0</b><span>tasks delivered</span></div>
+      <div><b id="hCol">0</b><span>collisions</span></div>
+      <div><b id="hNear">0</b><span>near misses</span></div>
+      <div><b id="hDead">0</b><span>deadlocks</span></div>
+    </div>
+    <div class="stage">
+      <canvas id="c2d"></canvas>
+      <div id="c3d"></div>
+      <div class="switch">
+        <button class="vw on" data-view="2d">2D grid</button>
+        <button class="vw" data-view="3d">3D twin</button>
+      </div>
+      <div id="banner" hidden></div>
+      <div class="legend"><span class="k n"></span>Clear <span class="k c"></span>Caution <span class="k h"></span>Hard stop <span class="k f"></span>Failed</div>
+    </div>
+  </div>
+
+  <aside>
+    <section class="card"><h2>Fleet</h2><div id="fleet"></div></section>
+    <section class="card"><h2>Run goals</h2><div id="badges"></div></section>
+    <section class="card grow"><h2>Decision log</h2><div id="events"></div></section>
+  </aside>
+</main>
+
+<main id="tasks" class="page">
+  <section class="card wide">
+    <h2>Task queue</h2>
+    <table><thead><tr><th>Task</th><th>Start</th><th>Destination</th><th>Robot</th><th>Status</th></tr></thead><tbody id="taskRows"></tbody></table>
+    <h2 class="gap">New task</h2>
+    <div class="form">
+      <input id="sx" type="number" min="0" placeholder="Start x">
+      <input id="sy" type="number" min="0" placeholder="Start y">
+      <input id="dx" type="number" min="0" placeholder="Goal x">
+      <input id="dy" type="number" min="0" placeholder="Goal y">
+      <select id="tRobot"></select>
+      <button id="bTask" class="go">Add task</button>
+    </div>
+  </section>
+</main>
+
+<main id="validation" class="page">
+  <section class="card wide">
+    <h2>Stop and wait vs ARCNET</h2>
+    <p class="mute">Runs every scenario twice on the same layout and reports measured results only. Target: at least 20 percent faster with zero collisions.</p>
+    <button id="vbtn" class="go">Run validation</button>
+    <div id="vout"></div>
+  </section>
+</main>
+
+<div id="toast" hidden></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

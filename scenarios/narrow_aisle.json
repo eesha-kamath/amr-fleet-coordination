@@ -1,0 +1,32 @@
+{
+  "id": "narrow_aisle",
+  "name": "Narrow Aisle",
+  "description": "Two robots share a constrained aisle.",
+  "robots": [
+    {
+      "id": "R1",
+      "x": 2.5,
+      "y": 5.5
+    },
+    {
+      "id": "R2",
+      "x": 17.5,
+      "y": 5.5
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "start": [2, 5],
+      "destination": [17, 5],
+      "assigned_robot": "R1"
+    },
+    {
+      "id": "T002",
+      "start": [17, 5],
+      "destination": [2, 5],
+      "assigned_robot": "R2"
+    }
+  ],
+  "obstacles": []
+}

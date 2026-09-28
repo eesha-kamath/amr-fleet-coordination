@@ -1,0 +1,32 @@
+{
+  "id": "robot_failure",
+  "name": "Robot Failure",
+  "description": "Fleet continues after one robot fails.",
+  "robots": [
+    {
+      "id": "R1",
+      "x": 5.5,
+      "y": 5.5
+    },
+    {
+      "id": "R2",
+      "x": 15.5,
+      "y": 5.5
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "start": [5, 5],
+      "destination": [15, 5],
+      "assigned_robot": "R1"
+    },
+    {
+      "id": "T002",
+      "start": [15, 5],
+      "destination": [5, 5],
+      "assigned_robot": "R2"
+    }
+  ],
+  "obstacles": []
+}
