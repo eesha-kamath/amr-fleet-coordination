@@ -127,6 +127,9 @@ td.win{color:var(--ok);font-weight:600}td.bad{color:var(--red)}
 .kpi.good b{color:var(--ok)}.kpi.bad b{color:var(--red)}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
 .br{display:grid;grid-template-columns:150px 1fr;gap:8px;align-items:center;margin-bottom:10px}
+.tagwin{display:inline-block;margin-left:6px;font-style:normal;font-size:10px;padding:1px 7px;border-radius:99px;background:#1e3a28;color:var(--ok);border:1px solid #2f5a40;vertical-align:middle}
+.vtag{display:inline-block;font-size:10px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mute);cursor:help;text-transform:uppercase;letter-spacing:.03em}
+.kpi[title],.panel table tr[title] td:first-child,.tr[title]{cursor:help}
 .tr{position:relative;height:16px;background:var(--raise);border-radius:3px;margin-bottom:3px}
 .tr i{display:block;height:100%;border-radius:3px}
 .tr i.a{background:linear-gradient(90deg,var(--or),var(--am))}

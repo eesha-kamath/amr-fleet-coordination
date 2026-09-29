@@ -26,18 +26,18 @@
 
 <main id="monitor" class="page on">
   <aside>
-    <section class="card"><h2>Missions</h2><div id="missions"></div></section>
     <section class="card">
       <h2>Tools</h2>
       <div class="tools">
-        <button class="tool on" data-tool="view">Watch</button>
-        <button class="tool" data-tool="dispatch">Send robot</button>
-        <button class="tool" data-tool="block">Block cell</button>
-        <button class="tool" data-tool="wifi">Dead zone</button>
-        <button class="tool" data-tool="kill">Fail robot</button>
+        <button class="tool on" data-tool="view" title="Just watch the fleet run.">Watch</button>
+        <button class="tool" data-tool="dispatch" title="Click a robot, then click a cell to send it there.">Send robot</button>
+        <button class="tool" data-tool="block" title="Click a cell to drop an obstacle in the aisle.">Block cell</button>
+        <button class="tool" data-tool="wifi" title="Click a cell to create a communication dead zone.">Dead zone</button>
+        <button class="tool" data-tool="kill" title="Click a robot to fail it and watch the fleet recover.">Fail robot</button>
       </div>
       <p id="hint" class="mute"></p>
     </section>
+    <section class="card"><h2>Missions</h2><div id="missions"></div></section>
   </aside>
 
   <div class="center">
