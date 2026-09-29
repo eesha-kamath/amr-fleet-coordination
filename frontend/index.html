@@ -13,8 +13,7 @@
 <header>
   <div class="brand"><i></i>ARCNET</div>
   <nav>
-    <button class="tab on" data-tab="monitor">Monitor</button>
-    <button class="tab" data-tab="tasks">Tasks</button>
+    <button class="tab on" data-tab="monitor">Live</button>
     <button class="tab" data-tab="validation">Validation</button>
   </nav>
   <div class="ctl">
@@ -61,35 +60,53 @@
     </div>
   </div>
 
-  <aside>
-    <section class="card"><h2>Fleet</h2><div id="fleet"></div></section>
-    <section class="card"><h2>Run goals</h2><div id="badges"></div></section>
-    <section class="card grow"><h2>Decision log</h2><div id="events"></div></section>
+  <aside class="dock">
+    <div id="goals" class="goals"></div>
+    <div class="dtabs">
+      <button class="dt on" data-dock="fleet">Fleet <i id="nFleet"></i></button>
+      <button class="dt" data-dock="tasks">Tasks <i id="nTasks"></i></button>
+      <button class="dt" data-dock="log">Log</button>
+    </div>
+    <section id="dock-fleet" class="dp on"><div id="fleet"></div></section>
+    <section id="dock-tasks" class="dp">
+      <div id="taskList"></div>
+      <button id="bNew" class="ghost">New task</button>
+      <div id="taskForm" class="form" hidden>
+        <input id="sx" type="number" min="0" placeholder="Start x">
+        <input id="sy" type="number" min="0" placeholder="Start y">
+        <input id="dx" type="number" min="0" placeholder="Goal x">
+        <input id="dy" type="number" min="0" placeholder="Goal y">
+        <select id="tRobot"></select>
+        <button id="bTask" class="go">Add task</button>
+      </div>
+    </section>
+    <section id="dock-log" class="dp">
+      <div class="filters">
+        <button class="fc on" data-filter="all">All</button>
+        <button class="fc" data-filter="safety">Safety</button>
+        <button class="fc" data-filter="conflict">Conflicts</button>
+        <button class="fc" data-filter="task">Tasks</button>
+        <button class="fc" data-filter="fault">Faults</button>
+      </div>
+      <div id="events"></div>
+    </section>
   </aside>
 </main>
 
-<main id="tasks" class="page">
-  <section class="card wide">
-    <h2>Task queue</h2>
-    <table><thead><tr><th>Task</th><th>Start</th><th>Destination</th><th>Robot</th><th>Status</th></tr></thead><tbody id="taskRows"></tbody></table>
-    <h2 class="gap">New task</h2>
-    <div class="form">
-      <input id="sx" type="number" min="0" placeholder="Start x">
-      <input id="sy" type="number" min="0" placeholder="Start y">
-      <input id="dx" type="number" min="0" placeholder="Goal x">
-      <input id="dy" type="number" min="0" placeholder="Goal y">
-      <select id="tRobot"></select>
-      <button id="bTask" class="go">Add task</button>
-    </div>
-  </section>
-</main>
-
 <main id="validation" class="page">
-  <section class="card wide">
-    <h2>Stop and wait vs ARCNET</h2>
-    <p class="mute">Runs every scenario twice on the same layout and reports measured results only. Target: at least 20 percent faster with zero collisions.</p>
-    <button id="vbtn" class="go">Run validation</button>
-    <div id="vout"></div>
+  <section class="vwrap">
+    <div class="vhead">
+      <div>
+        <h2>Validation</h2>
+        <p class="mute">Every scenario layout runs twice on identical conditions, stop and wait against ARCNET. Measured values only.</p>
+      </div>
+      <div class="vact">
+        <button id="vcsv" hidden>Export CSV</button>
+        <button id="vbtn" class="go">Run validation</button>
+      </div>
+    </div>
+    <div id="vprog" class="prog" hidden><div class="pb"><i id="vbar"></i></div><span id="vtext"></span></div>
+    <div id="vout"><p class="mute">No results yet. Run validation to measure both strategies.</p></div>
   </section>
 </main>
 

@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .session import Session, run_validation
+from .session import Session, start_validation, validation_status
 
 app = FastAPI(title="ARCNET API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -76,8 +76,14 @@ def fault(data: dict):
 
 
 @app.post("/api/validation/run")
-def validation():
-    return {"rows": guard(run_validation)}
+def validation_run():
+    guard(start_validation)
+    return validation_status()
+
+
+@app.get("/api/validation/status")
+def validation_state():
+    return validation_status()
 
 
 @app.websocket("/ws")

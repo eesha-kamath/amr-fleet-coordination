@@ -56,7 +56,7 @@ function update() {
   $("hCol").parentElement.classList.toggle("bad", (m.collisions ?? 0) > 0);
   if (S.running) setPill("Running", "run"); else if ($("pill").textContent === "Running") setPill("Connected", "ok");
 
-  renderFleet(); renderBadges(total, done, m); renderEvents(); renderTasks();
+  renderFleet(); renderGoals(total, done, m); renderEvents(); renderTasks();
   document.querySelectorAll(".mis").forEach(b => b.classList.toggle("on", b.dataset.id === S.scenario));
 
   if (S.running) $("banner").hidden = true;
@@ -66,43 +66,56 @@ function update() {
 }
 
 function renderFleet() {
+  $("nFleet").textContent = S.robots.length;
   $("fleet").innerHTML = S.robots.map(r => {
     const st = safe(r), bat = Math.max(0, Math.min(100, r.battery ?? 0));
+    const line = st === "failed" ? "Failed"
+      : r.mode === "idle" ? (r.task_id ? "Task " + r.task_id : "Idle")
+      : (r.task_id ? r.task_id + ": " : "") + (r.reason || r.mode);
+    const why = r.waiting_for ? `Waiting for ${r.waiting_for}, priority tier ${r.priority_tier}, clock ${r.logical_clock}` : "";
     return `<div class="rb ${picked === r.id ? "pick" : ""} ${st === "failed" ? "dead" : ""}" data-id="${r.id}">
       <div><strong>${r.id}</strong><span class="chip ${st}">${st.replace("_", " ")}</span></div>
-      <small>${r.task_id ? "Task " + r.task_id : "Idle"}${r.reason ? " - " + r.reason : ""}</small>
+      <small>${line}</small>${why ? `<small class="why">${why}</small>` : ""}
       <div class="bar"><i style="width:${bat}%"></i></div></div>`;
   }).join("") || '<p class="mute">No robots loaded.</p>';
 }
 
-function renderBadges(total, done, m) {
+function renderGoals(total, done, m) {
   const all = total > 0 && done === total;
   const clean = (m.near_misses ?? 0) === 0 && (m.deadlocks ?? 0) === 0 && (m.collisions ?? 0) === 0;
   const rows = [
-    ["Zero collisions", "No robot touches another", (m.collisions ?? 0) > 0 ? "lost" : all ? "earned" : "holding"],
-    ["All tasks delivered", done + " of " + total + " done", all ? "earned" : "holding"],
-    ["Smooth run", "No near misses or deadlocks", !clean ? "lost" : all ? "earned" : "holding"]
+    ["Zero collisions", (m.collisions ?? 0) > 0 ? "lost" : all ? "earned" : "holding"],
+    ["Delivered " + done + "/" + total, all ? "earned" : "holding"],
+    ["Smooth run", !clean ? "lost" : all ? "earned" : "holding"]
   ];
-  $("badges").innerHTML = rows.map(([a, b, s]) =>
-    `<div class="bd ${s}"><div><b>${a}</b><br><span>${b}</span></div><span>${s}</span></div>`).join("");
+  $("goals").innerHTML = rows.map(([a, s]) => `<span class="gl ${s}">${a}</span>`).join("");
 }
 
+const KIND = { SAFETY: "Safety", DEADLOCK: "Deadlock", YIELD: "Yield", TASK: "Task", FAULT: "Fault", REROUTE: "Reroute", SYSTEM: "System", SCENARIO: "System" };
+const GROUP = { all: null, safety: ["SAFETY"], conflict: ["DEADLOCK", "YIELD"], task: ["TASK"], fault: ["FAULT", "REROUTE"] };
+let logFilter = "all";
+
 function renderEvents() {
-  $("events").innerHTML = [...S.events].reverse().slice(0, 40).map(e =>
-    `<div class="ev ${e.kind || ""}"><time>${e.time}s</time>${e.message}</div>`).join("")
-    || '<p class="mute">Nothing yet. Press Start.</p>';
+  const g = GROUP[logFilter];
+  const list = [...S.events].reverse().filter(e => !g || g.includes(e.kind)).slice(0, 60);
+  $("events").innerHTML = list.map(e =>
+    `<div class="lg ${e.kind || ""}"><div class="lh"><time>${Number(e.time).toFixed(1)}s</time><b>${KIND[e.kind] || e.kind}</b><span>${e.source}</span></div><p>${e.message}</p></div>`
+  ).join("") || '<p class="mute">Nothing here yet.</p>';
 }
 
 function renderTasks() {
+  $("nTasks").textContent = S.tasks.filter(t => !t.completed).length;
   const sig = JSON.stringify(S.tasks) + S.robots.map(r => r.id).join();
   if (sig === taskSig) return;
   taskSig = sig;
   const opts = sel => '<option value="">unassigned</option>' +
     S.robots.map(r => `<option ${r.id === sel ? "selected" : ""}>${r.id}</option>`).join("");
-  $("taskRows").innerHTML = S.tasks.map(t =>
-    `<tr><td>${t.id}</td><td>(${t.start.join(", ")})</td><td>(${t.destination.join(", ")})</td>
-     <td><select data-task="${t.id}">${opts(t.assigned_robot)}</select></td>
-     <td><span class="chip ${t.status}">${t.status}</span></td></tr>`).join("");
+  $("taskList").innerHTML = S.tasks.map(t => {
+    const label = t.completed ? "completed" : (t.phase || t.status);
+    return `<div class="tk"><div><b>${t.id}</b><small>(${t.start.join(", ")}) to (${t.destination.join(", ")})</small></div>
+      <span class="chip ${t.completed ? "completed" : t.status}">${label}</span>
+      <select data-task="${t.id}">${opts(t.assigned_robot)}</select></div>`;
+  }).join("") || '<p class="mute">No tasks.</p>';
   $("tRobot").innerHTML = opts("");
 }
 
@@ -259,36 +272,148 @@ async function loadScenarios() {
     `<button class="mis" data-id="${s.id}">${s.name}<small>${s.description || ""}</small></button>`).join("");
 }
 
-async function runValidation() {
-  const btn = $("vbtn"), out = $("vout");
-  btn.disabled = true; out.textContent = "Running both strategies on every scenario...";
-  const res = await api("/api/validation/run");
-  btn.disabled = false;
-  if (!res) { out.textContent = "The validation endpoint is not available on the backend yet."; return; }
-  const rows = res.rows || res, by = {};
+// board-start (pure helpers, no DOM)
+const fin = r => r.tasks_failed === 0 && r.tasks_completed === r.tasks_total;
+const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+const sum = (a, k) => a.reduce((n, r) => n + (r[k] || 0), 0);
+
+function boardStats(rows, limit) {
+  const by = {};
   rows.forEach(r => (by[r.scenario] = by[r.scenario] || {})[r.strategy] = r);
-  const fin = r => r && r.tasks_failed === 0 && r.tasks_completed === r.tasks_total;
-  const gains = [];
-  const body = Object.entries(by).map(([name, p]) => {
-    const b = p.stop_and_wait, a = p.arcnet, ok = fin(a) && fin(b);
-    const gain = ok ? (b.completion_time - a.completion_time) / b.completion_time * 100 : null;
-    if (ok) gains.push(gain);
-    return `<tr><td>${name}</td><td>${fin(b) ? b.completion_time.toFixed(1) + " s" : "did not finish"}</td>
-      <td>${fin(a) ? a.completion_time.toFixed(1) + " s" : "did not finish"}</td>
-      <td class="${gain === null ? "" : gain >= 20 ? "win" : gain < 0 ? "bad" : ""}">${gain === null ? "not comparable" : gain.toFixed(1) + "%"}</td>
-      <td>${b ? b.collisions : "-"} / ${a ? a.collisions : "-"}</td></tr>`;
+  const pairs = Object.values(by).filter(p => p.stop_and_wait && p.arcnet);
+  const cmp = pairs.filter(p => fin(p.stop_and_wait) && fin(p.arcnet));
+  const gain = p => (p.stop_and_wait.completion_time - p.arcnet.completion_time) / p.stop_and_wait.completion_time * 100;
+  const at = r => fin(r) ? r.completion_time : limit;
+  const A = rows.filter(r => r.strategy === "arcnet"), B = rows.filter(r => r.strategy === "stop_and_wait");
+  return {
+    pairs, cmp, gain, n: pairs.length, A, B,
+    mean: avg(cmp.map(gain)),
+    bound: avg(pairs.map(p => (at(p.stop_and_wait) - at(p.arcnet)) / at(p.stop_and_wait) * 100)),
+    doneA: A.filter(fin).length, doneB: B.filter(fin).length,
+    colA: sum(A, "collisions"), colB: sum(B, "collisions"),
+    worst: cmp.length ? cmp.reduce((w, p) => gain(p) < gain(w) ? p : w) : null
+  };
+}
+
+function aggRows(st) {
+  const cA = st.cmp.map(p => p.arcnet), cB = st.cmp.map(p => p.stop_and_wait);
+  const per = (rs, f) => avg(rs.map(f));
+  const gaps = rs => { const g = rs.map(r => r.min_gap_m).filter(v => v != null); return g.length ? Math.min(...g) : null; };
+  return [
+    ["Time to finish all tasks (s)", per(cB, r => r.completion_time), per(cA, r => r.completion_time), "low", "runs both finished"],
+    ["Average delivery time (s)", per(cB, r => r.avg_task_s), per(cA, r => r.avg_task_s), "low", "runs both finished"],
+    ["Throughput (tasks per minute)", per(cB, r => r.tasks_completed / r.completion_time * 60), per(cA, r => r.tasks_completed / r.completion_time * 60), "high", "runs both finished"],
+    ["Standing time per robot with a job (s)", per(cB, r => r.wait_s / r.robots), per(cA, r => r.wait_s / r.robots), "low", "runs both finished"],
+    ["Distance per delivered task (m)", per(cB, r => r.distance_m / r.tasks_completed), per(cA, r => r.distance_m / r.tasks_completed), "low", "runs both finished"],
+    ["Stops", sum(st.B, "stops"), sum(st.A, "stops"), "low", "all runs"],
+    ["Replans", sum(st.B, "replans"), sum(st.A, "replans"), "info", "all runs"],
+    ["Deadlocks detected", sum(st.B, "deadlocks"), sum(st.A, "deadlocks"), "low", "all runs"],
+    ["Deadlocks resolved", sum(st.B, "deadlocks_resolved"), sum(st.A, "deadlocks_resolved"), "high", "all runs"],
+    ["Yield negotiations", sum(st.B, "yields"), sum(st.A, "yields"), "info", "all runs"],
+    ["Near misses", sum(st.B, "near_misses"), sum(st.A, "near_misses"), "low", "all runs"],
+    ["Collisions", st.colB, st.colA, "low", "all runs"],
+    ["Closest approach (m)", gaps(st.B), gaps(st.A), "high", "all runs"]
+  ];
+}
+// board-end
+
+const f1 = v => v == null ? "-" : Number.isInteger(v) ? v : v.toFixed(1);
+let lastRows = [], valTimer = null;
+
+function renderBoard(rows, limit) {
+  const st = boardStats(rows, limit), out = $("vout");
+  if (!st.n) { out.innerHTML = '<p class="mute">No results yet.</p>'; return; }
+  const met = st.mean !== null && st.mean >= 20;
+  const head = st.mean === null ? "No run finished under both strategies, so no time comparison is possible."
+    : (met ? "Target met: " : "Below the 20 percent target: ") + `ARCNET was ${st.mean.toFixed(1)}% faster on average across ${st.cmp.length} runs both strategies finished.`;
+  const worst = st.worst && st.gain(st.worst) < 0 ? st.gain(st.worst) : null;
+  const kpi = (v, l, c) => `<div class="kpi ${c || ""}"><b>${v}</b><span>${l}</span></div>`;
+
+  const ids = [...new Set(rows.map(r => r.scenario_id))];
+  const val = r => fin(r) ? r.completion_time : limit;
+  const bars = ids.map(id => {
+    const b = st.B.filter(r => r.scenario_id === id), a = st.A.filter(r => r.scenario_id === id);
+    const mb = avg(b.map(val)), ma = avg(a.map(val)), dnf = b.filter(r => !fin(r)).length, dnfA = a.filter(r => !fin(r)).length;
+    const w = v => Math.min(100, v / limit * 100).toFixed(1) + "%";
+    return `<div class="br"><span>${id.replace(/_/g, " ")}</span><div>
+      <div class="tr"><i class="b ${dnf ? "dnf" : ""}" style="width:${w(mb)}"></i><em>Stop and wait ${mb.toFixed(1)} s${dnf ? ", " + dnf + " of " + b.length + " did not finish" : ""}</em></div>
+      <div class="tr"><i class="a" style="width:${w(ma)}"></i><em>ARCNET ${ma.toFixed(1)} s${dnfA ? ", " + dnfA + " did not finish" : ""}</em></div></div></div>`;
   }).join("");
-  const mean = gains.length ? gains.reduce((x, y) => x + y, 0) / gains.length : null;
-  const arcCol = Object.values(by).reduce((n, p) => n + (p.arcnet ? p.arcnet.collisions : 0), 0);
-  out.innerHTML = `<p><strong>${mean === null ? "No comparable scenarios yet." :
-    "Mean improvement " + mean.toFixed(1) + "% across " + gains.length + " of " + Object.keys(by).length + " scenarios."}</strong>
-    ARCNET collisions: ${arcCol}.</p>
-    <table><thead><tr><th>Scenario</th><th>Stop and wait</th><th>ARCNET</th><th>Change</th><th>Collisions (base / ARCNET)</th></tr></thead><tbody>${body}</tbody></table>`;
+
+  const agg = aggRows(st).map(([name, b, a, dir, basis]) => {
+    let d = "-", cls = "";
+    if (typeof b === "number" && typeof a === "number" && b !== 0) {
+      const pc = (a - b) / b * 100;
+      d = (pc > 0 ? "+" : "") + pc.toFixed(0) + "%";
+      if (dir !== "info" && Math.abs(pc) >= 1) cls = ((dir === "low") === (pc < 0)) ? "good" : "worse";
+    }
+    return `<tr><td>${name}</td><td>${f1(b)}</td><td>${f1(a)}</td><td class="${cls}">${d}</td><td class="mute">${basis}</td></tr>`;
+  }).join("");
+
+  const detail = st.pairs.map(p => {
+    const b = p.stop_and_wait, a = p.arcnet, ok = fin(a) && fin(b), g = ok ? st.gain(p) : null;
+    return `<tr><td>${a.scenario}</td><td>${fin(b) ? b.completion_time + " s" : "did not finish"}</td><td>${fin(a) ? a.completion_time + " s" : "did not finish"}</td>
+      <td class="${g === null ? "" : g >= 20 ? "good" : g < 0 ? "worse" : ""}">${g === null ? "not comparable" : g.toFixed(1) + "%"}</td>
+      <td>${b.wait_s} / ${a.wait_s}</td><td>${b.distance_m} / ${a.distance_m}</td><td>${b.collisions} / ${a.collisions}</td></tr>`;
+  }).join("");
+
+  out.innerHTML = `
+    <div class="verdict ${met ? "ok" : "warn"}"><b>${head}</b>
+      <span class="mute">ARCNET finished ${st.doneA} of ${st.n} runs and stop and wait finished ${st.doneB}. ARCNET collisions: ${st.colA}.</span></div>
+    <div class="kpis">
+      ${kpi(st.doneA + " / " + st.n, "Runs finished by ARCNET (stop and wait: " + st.doneB + ")", st.doneA > st.doneB ? "good" : "")}
+      ${kpi(st.mean === null ? "-" : st.mean.toFixed(1) + "%", "Time saved, runs both finished (" + st.cmp.length + ")", met ? "good" : "")}
+      ${kpi(st.bound === null ? "-" : st.bound.toFixed(1) + "%", "Time saved if unfinished runs count as " + limit + " s (lower bound)")}
+      ${kpi(st.colA, "ARCNET collisions (stop and wait: " + st.colB + ")", st.colA === 0 ? "good" : "bad")}
+      ${kpi(worst === null ? "None" : worst.toFixed(1) + "%", worst === null ? "Scenarios where ARCNET was slower" : "Worst case: " + st.worst.arcnet.scenario, worst === null ? "good" : "bad")}
+    </div>
+    <div class="panel"><h2>Time to finish by scenario</h2>
+      <div class="key"><span>Shorter is better</span><span>Hatched: some runs did not finish, counted at ${limit} s</span></div>${bars}</div>
+    <div class="panel"><h2>All measured metrics</h2>
+      <table><thead><tr><th>Metric</th><th>Stop and wait</th><th>ARCNET</th><th>Change</th><th>Basis</th></tr></thead><tbody>${agg}</tbody></table></div>
+    <div class="panel"><details><summary>Every run (${st.n} scenario layouts)</summary>
+      <table><thead><tr><th>Scenario</th><th>Stop and wait</th><th>ARCNET</th><th>Change</th><th>Standing s (base / ARCNET)</th><th>Distance m</th><th>Collisions</th></tr></thead><tbody>${detail}</tbody></table></details></div>`;
+}
+
+async function pollVal() {
+  const v = await api("/api/validation/status", "GET");
+  if (!v) return;
+  const running = v.state === "running";
+  $("vbtn").disabled = running;
+  $("vprog").hidden = !running;
+  if (running) {
+    $("vbar").style.width = (v.done / v.total * 100) + "%";
+    $("vtext").textContent = "Running " + v.done + " of " + v.total + " runs";
+    clearTimeout(valTimer); valTimer = setTimeout(pollVal, 800);
+  } else if (v.state === "error") $("vout").textContent = "Validation failed: " + v.error;
+  else if (v.state === "done") { lastRows = v.rows; renderBoard(v.rows, v.limit); $("vcsv").hidden = false; }
+}
+
+async function runValidation() { await api("/api/validation/run"); pollVal(); }
+
+function exportCsv() {
+  if (!lastRows.length) return;
+  const keys = Object.keys(lastRows[0]);
+  const csv = [keys.join(",")].concat(lastRows.map(r => keys.map(k => JSON.stringify(r[k] ?? "")).join(","))).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = "arcnet_validation.csv"; a.click();
 }
 
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-tab],[data-tool],[data-view],.mis,.rb");
+  const t = e.target.closest("[data-tab],[data-tool],[data-view],[data-dock],[data-filter],.mis,.rb");
   if (!t) return;
+  if (t.dataset.dock) {
+    document.querySelectorAll(".dt").forEach(b => b.classList.toggle("on", b === t));
+    document.querySelectorAll(".dp").forEach(p => p.classList.toggle("on", p.id === "dock-" + t.dataset.dock));
+    return;
+  }
+  if (t.dataset.filter) {
+    logFilter = t.dataset.filter;
+    document.querySelectorAll(".fc").forEach(b => b.classList.toggle("on", b === t));
+    if (S) renderEvents();
+    return;
+  }
   if (t.dataset.tab) {
     document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b === t));
     document.querySelectorAll(".page").forEach(p => p.classList.toggle("on", p.id === t.dataset.tab));
@@ -309,6 +434,8 @@ $("bStart").onclick = () => api("/api/run/start");
 $("bStop").onclick = () => api("/api/run/stop");
 $("bReset").onclick = async () => { await api("/api/run/reset"); $("banner").hidden = true; };
 $("vbtn").onclick = runValidation;
+$("vcsv").onclick = exportCsv;
+$("bNew").onclick = () => { $("taskForm").hidden = !$("taskForm").hidden; };
 $("bTask").onclick = () => {
   const v = id => Number($(id).value);
   if (!S) return;
@@ -324,3 +451,4 @@ addEventListener("resize", () => {
 $("hint").textContent = HINT.view;
 connect();
 loadScenarios();
+pollVal();

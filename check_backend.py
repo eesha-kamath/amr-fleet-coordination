@@ -69,7 +69,10 @@ with TestClient(app) as c:
     print("  sim time", s["time"], "metrics", s["metrics"])
 
     if "--validation" in sys.argv:
-        rows = c.post("/api/validation/run").json()["rows"]
+        c.post("/api/validation/run")
+        while c.get("/api/validation/status").json()["state"] == "running":
+            time.sleep(1)
+        rows = c.get("/api/validation/status").json()["rows"]
         inst = {(r["scenario_id"], r["variant"]) for r in rows}
         results.append(ok(f"validation ran {len(inst)} scenario instances (need 20+)", len(inst) >= 20))
         arc = [r for r in rows if r["strategy"] == "arcnet"]

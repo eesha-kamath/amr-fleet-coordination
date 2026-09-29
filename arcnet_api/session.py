@@ -1,5 +1,6 @@
 # Adapter between the API and CoordinationRuntime. The backend owns all state.
 import csv
+from math import hypot
 import threading
 import time
 import traceback
@@ -265,11 +266,16 @@ class Session:
                     "safety": "failed" if failed else (val(getattr(a, "safety", None)) or "normal"),
                     "reason": getattr(a, "reason", ""),
                     "silent": bool(getattr(a, "silent", False)),
+                    "waiting_for": getattr(a, "waiting_for", None),
+                    "wait_time": round(getattr(a, "wait_time", 0.0), 1),
+                    "priority_tier": rt.arbiter.aging_tier(getattr(a, "wait_time", 0.0)) if a else 0,
+                    "logical_clock": getattr(a, "req_clock", 0),
                     "plan": [list(c) for c in (getattr(a, "plan", None) or [])],
                 })
             tasks = [{
                 "id": t.id, "start": list(t.start), "destination": list(t.destination),
                 "assigned_robot": t.assigned_robot, "completed": t.completed, "status": val(t.status),
+                "phase": rt.phase.get(t.id),
             } for t in rt.tasks.values()]
             m = rt.metrics
             spec = next(iter(rt.sim.robot_specs.values()), None)
@@ -316,6 +322,54 @@ def variant_data(data, variant):
     return {**data, "robots": robots, "tasks": tasks, "obstacles": obstacles}
 
 
+def run_instrumented(rt, limit, kills):
+    """Steps the runtime and measures extra metrics from ground truth."""
+    counts = {}
+    orig = rt._log
+
+    def counting(kind, source, message, *a, **k):
+        last = rt.events[-1] if rt.events else None
+        orig(kind, source, message, *a, **k)
+        if rt.events and rt.events[-1] is not last:
+            counts[kind] = counts.get(kind, 0) + 1
+
+    rt._log = counting
+    dt = rt.sim.config.dt
+    prev = {r.id: (r.x, r.y) for r in rt.sim.robots.values()}
+    dist = wait = 0.0
+    done_at = {}
+
+    while rt.time < limit and not rt.finished():
+        while kills and rt.time >= kills[0][0]:
+            kill_robot(rt, kills.pop(0)[1])
+        rt.step()
+        for r in rt.sim.robots.values():
+            moved = hypot(r.x - prev[r.id][0], r.y - prev[r.id][1])
+            prev[r.id] = (r.x, r.y)
+            dist += moved
+            agent = rt.agents[r.id]
+            if agent.mode != "failed" and rt._task_for(agent) and moved < 0.005:
+                wait += dt
+        for t in rt.tasks.values():
+            if t.completed and t.id not in done_at:
+                done_at[t.id] = rt.time
+
+    rt._log = orig
+    m = rt.metrics
+    m.completion_time = rt._finished_at if rt._finished_at is not None else rt.time
+    gap = rt.judge.min_gap
+    return {
+        "completion_time": round(m.completion_time, 1),
+        "distance_m": round(dist, 1),
+        "wait_s": round(wait, 1),
+        "avg_task_s": round(sum(done_at.values()) / len(done_at), 1) if done_at else None,
+        "min_gap_m": None if gap == float("inf") else round(gap, 2),
+        "yields": counts.get("YIELD", 0),
+        "reroutes": counts.get("REROUTE", 0),
+        "robots": len(rt.agents),
+    }
+
+
 def run_scenario(sid, variant, strategy, limit):
     tc, _ = make_transform(variant, GRID[0])
     faults = SCENARIO_FAULTS.get(sid, {})
@@ -323,41 +377,51 @@ def run_scenario(sid, variant, strategy, limit):
     zones = {tc(x, y) for x, y in faults.get("wifi", [])}
     if zones and hasattr(rt, "set_wifi_zones"):
         rt.set_wifi_zones(zones)
-    kills = list(faults.get("kill", []))
-    if not kills:
-        return rt, rt.run(limit)
-    while rt.time < limit and not settled(rt):
-        while kills and rt.time >= kills[0][0]:
-            kill_robot(rt, kills.pop(0)[1])
-        rt.step()
-    rt.metrics.completion_time = rt.time
-    return rt, rt.metrics
+    extra = run_instrumented(rt, limit, list(faults.get("kill", [])))
+    return rt, rt.metrics, extra
 
 
+# Validation runs in a background thread so the UI can show progress.
+VAL = {"state": "idle", "done": 0, "total": 0, "limit": 120.0, "rows": [], "error": None}
 _val_lock = threading.Lock()
 
 
-def run_validation(limit=120.0, csv_path="validation_results.csv"):
-    if not _val_lock.acquire(blocking=False):
-        raise ValueError("Validation is already running")
+def validation_status():
+    return dict(VAL)
+
+
+def start_validation(limit=120.0):
+    with _val_lock:
+        if VAL["state"] == "running":
+            raise ValueError("Validation is already running")
+        total = len(ScenarioLibrary().all()) * len(VARIANTS) * 2
+        VAL.update(state="running", done=0, total=total, limit=limit, rows=[], error=None)
+    threading.Thread(target=_validation_worker, args=(limit,), daemon=True).start()
+
+
+def _validation_worker(limit, csv_path="validation_results.csv"):
     try:
         rows = []
         for sid in ScenarioLibrary().all():
             for n, variant in enumerate(VARIANTS, start=1):
                 for strategy in ("stop_and_wait", "arcnet"):
-                    rt, m = run_scenario(sid, variant, strategy, limit)
+                    rt, m, extra = run_scenario(sid, variant, strategy, limit)
                     rows.append({
                         "scenario": f"{sid} ({variant})", "scenario_id": sid, "variant": variant,
-                        "run": n, "strategy": strategy, "completion_time": m.completion_time,
+                        "run": n, "strategy": strategy,
                         "collisions": m.collisions, "near_misses": m.near_misses, "stops": m.stops,
                         "replans": m.replans, "deadlocks": m.deadlocks_detected,
                         "deadlocks_resolved": m.deadlocks_resolved, "tasks_total": len(rt.tasks),
                         "tasks_completed": m.tasks_completed, "tasks_failed": m.tasks_failed,
+                        **extra,
                     })
+                    VAL["done"] += 1
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
-        return rows
-    finally:
-        _val_lock.release()
+        VAL["rows"] = rows
+        VAL["state"] = "done"
+    except Exception as e:
+        traceback.print_exc()
+        VAL.update(state="error", error=str(e))
