@@ -1,19 +1,23 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from .session import SimulationSession
 import asyncio
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from .session import Session, run_validation
 
 app = FastAPI(title="ARCNET API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+session = Session()
 
-session = SimulationSession()
+
+def guard(fn, *args):
+    try:
+        return fn(*args)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/state")
@@ -29,13 +33,13 @@ def scenarios():
 @app.post("/api/run/start")
 def start():
     session.start()
-    return {"ok": True, "running": True}
+    return {"ok": True}
 
 
 @app.post("/api/run/stop")
 def stop():
     session.stop()
-    return {"ok": True, "running": False}
+    return {"ok": True}
 
 
 @app.post("/api/run/reset")
@@ -46,35 +50,46 @@ def reset():
 
 @app.post("/api/scenario/{scenario_id}")
 def scenario(scenario_id: str):
-    session.load_scenario(scenario_id)
+    guard(session.load, scenario_id)
     return {"ok": True, "scenario": scenario_id}
+
+
+@app.post("/api/strategy/{name}")
+def strategy(name: str):
+    guard(session.set_strategy, name)
+    return {"ok": True, "strategy": name}
 
 
 @app.post("/api/task")
 def task(data: dict):
-    return session.add_task(data)
+    return guard(session.add_task, data)
 
 
 @app.post("/api/task/{task_id}/assign")
 def assign(task_id: str, data: dict):
-    return session.assign_task(
-        task_id,
-        data.get("robot_id")
-    )
+    return guard(session.assign_task, task_id, data.get("robot_id"))
 
 
 @app.post("/api/fault")
 def fault(data: dict):
-    return session.add_fault(data)
+    return guard(session.add_fault, data)
+
+
+@app.post("/api/validation/run")
+def validation():
+    return {"rows": guard(run_validation)}
 
 
 @app.websocket("/ws")
-async def websocket(websocket: WebSocket):
-    await websocket.accept()
-
+async def ws(w: WebSocket):
+    await w.accept()
     try:
         while True:
-            await websocket.send_json(session.state())
+            await w.send_json(session.state())
             await asyncio.sleep(0.1)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
+
+
+FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
+app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="ui")

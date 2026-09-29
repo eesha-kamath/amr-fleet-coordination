@@ -1,0 +1,6648 @@
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\dev_preview.py ================
+
+# UI-only preview with fake data. Not part of the product.
+import asyncio
+import math
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI()
+sim = {"t": 0.0, "on": False}
+
+
+def state():
+    p = sim["t"] % 15
+    return {
+        "time": round(sim["t"], 1),
+        "running": sim["on"],
+        "scenario": "head_on",
+        "grid": {"width": 20, "height": 12, "cell_size": 1.0},
+        "robots": [
+            {"id": "R1", "x": 2.5 + p, "y": 3.5, "theta": 0, "battery": 82,
+             "active": True, "task_id": "T001", "mode": "moving", "safety": "normal",
+             "plan": [[i, 3] for i in range(int(2.5 + p), 18)]},
+            {"id": "R2", "x": 17.5 - p, "y": 5.5, "theta": math.pi, "battery": 64,
+             "active": True, "task_id": "T002", "mode": "moving", "safety": "caution",
+             "reason": "R1 ahead", "plan": [[i, 5] for i in range(2, int(17.5 - p) + 1)]},
+            {"id": "R3", "x": 10.5, "y": 8.5, "theta": -1.57, "battery": 40,
+             "active": True, "task_id": None, "mode": "idle", "safety": "hard_stop"},
+        ],
+        "tasks": [
+            {"id": "T001", "start": [2, 3], "destination": [17, 3], "assigned_robot": "R1",
+             "completed": False, "status": "active"},
+            {"id": "T002", "start": [17, 5], "destination": [2, 5], "assigned_robot": "R2",
+             "completed": False, "status": "active"},
+        ],
+        "obstacles": [{"x": x, "y": 7, "temporary": False} for x in range(4, 9)]
+                     + [{"x": 12, "y": 4, "temporary": True}],
+        "events": [
+            {"time": 1.0, "kind": "TASK", "source": "R1", "message": "R1 started T001"},
+            {"time": 2.4, "kind": "YIELD", "source": "R2", "message": "R2 waits for R1"},
+            {"time": 3.1, "kind": "SAFETY", "source": "R3", "message": "R3 hard stop"},
+        ],
+        "metrics": {"collisions": 0, "near_misses": 1, "deadlocks": 0},
+    }
+
+
+@app.get("/api/scenarios")
+def scenarios():
+    return [{"id": "head_on", "name": "Head-on", "description": "Two robots, one aisle"},
+            {"id": "four_way_choke", "name": "4-way choke", "description": "Four robots, one crossing"}]
+
+
+@app.post("/api/run/start")
+def start():
+    sim["on"] = True
+    return {"ok": True}
+
+
+@app.post("/api/run/stop")
+def stop():
+    sim["on"] = False
+    return {"ok": True}
+
+
+@app.post("/api/run/reset")
+def reset():
+    sim["on"] = False
+    sim["t"] = 0.0
+    return {"ok": True}
+
+
+@app.post("/api/{rest:path}")
+def anything(rest: str, data: dict = None):
+    return {"ok": True}
+
+
+@app.websocket("/ws")
+async def ws(w: WebSocket):
+    await w.accept()
+    try:
+        while True:
+            if sim["on"]:
+                sim["t"] += 0.1
+            await w.send_json(state())
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+
+
+app.mount("/", StaticFiles(directory="frontend", html=True), name="ui")
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_api\main.py ================
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from .session import SimulationSession
+import asyncio
+
+app = FastAPI(title="ARCNET API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+session = SimulationSession()
+
+
+@app.get("/api/state")
+def state():
+    return session.state()
+
+
+@app.get("/api/scenarios")
+def scenarios():
+    return session.scenarios()
+
+
+@app.post("/api/run/start")
+def start():
+    session.start()
+    return {"ok": True, "running": True}
+
+
+@app.post("/api/run/stop")
+def stop():
+    session.stop()
+    return {"ok": True, "running": False}
+
+
+@app.post("/api/run/reset")
+def reset():
+    session.reset()
+    return {"ok": True}
+
+
+@app.post("/api/scenario/{scenario_id}")
+def scenario(scenario_id: str):
+    session.load_scenario(scenario_id)
+    return {"ok": True, "scenario": scenario_id}
+
+
+@app.post("/api/task")
+def task(data: dict):
+    return session.add_task(data)
+
+
+@app.post("/api/task/{task_id}/assign")
+def assign(task_id: str, data: dict):
+    return session.assign_task(
+        task_id,
+        data.get("robot_id")
+    )
+
+
+@app.post("/api/fault")
+def fault(data: dict):
+    return session.add_fault(data)
+
+
+@app.websocket("/ws")
+async def websocket(websocket: WebSocket):
+    await websocket.accept()
+
+    try:
+        while True:
+            await websocket.send_json(session.state())
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_api\models.py ================
+
+from pydantic import BaseModel
+
+
+class TaskInput(BaseModel):
+    id: str
+    start: tuple[int, int]
+    destination: tuple[int, int]
+    assigned_robot: str | None = None
+
+
+class AssignInput(BaseModel):
+    robot_id: str
+
+
+class FaultInput(BaseModel):
+    kind: str
+    target: str | None = None
+    x: int | None = None
+    y: int | None = None
+
+
+class ScenarioInput(BaseModel):
+    scenario_id: str
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_api\session.py ================
+
+import asyncio
+from math import sqrt
+
+from arcnet_core.robot import RobotSpec
+from arcnet_core.grid import Grid
+from arcnet_core.obstacle import Obstacle
+from arcnet_core.config import SafetyConfig
+from arcnet_core.engine import ArcnetEngine
+from arcnet_core.simulator import WarehouseSimulator
+from arcnet_core.task import Task, TaskStatus
+from arcnet_core.motion import MotionCommand
+from arcnet_core.scenarios import ScenarioLibrary
+from arcnet_core.faults import FaultManager
+
+
+class SimulationSession:
+    def __init__(self):
+        self.scenario_id = "default"
+        self.running = False
+        self.loop_task = None
+        self.events = []
+        self.faults = FaultManager()
+        self.library = ScenarioLibrary()
+
+        self.grid = Grid(20, 12, 1.0)
+
+        self.specs = {
+            "R1": self._spec("R1"),
+            "R2": self._spec("R2"),
+            "R3": self._spec("R3")
+        }
+
+        self.paths = {}
+
+        self.reset()
+
+    def _spec(self, robot_id):
+        return RobotSpec(
+            robot_id,
+            "rectangle",
+            0.9,
+            0.64,
+            0.19,
+            70,
+            0.5,
+            0.08,
+            1.0,
+            0.5,
+            0.8,
+            0.1
+        )
+
+    def _create(self, obstacles=None):
+        obstacles = obstacles or []
+
+        self.sim = WarehouseSimulator(
+            self.grid,
+            obstacles,
+            self.specs
+        )
+
+        self.engine = ArcnetEngine(
+            self.specs,
+            self.grid,
+            obstacles,
+            SafetyConfig()
+        )
+
+    def reset(self):
+        self.running = False
+        self.events.clear()
+        self.faults.clear()
+        self.paths.clear()
+
+        self._create()
+
+        self.sim.add_robot("R1", 2.5, 3.5)
+        self.sim.add_robot("R2", 17.5, 3.5)
+        self.sim.add_robot("R3", 10.5, 8.5)
+
+        self.sim.add_task(
+            Task("T001", (2, 3), (17, 3), "R1")
+        )
+
+        self.sim.add_task(
+            Task("T002", (17, 3), (2, 3), "R2")
+        )
+
+        self.sim.add_task(
+            Task("T003", (10, 8), (10, 2), "R3")
+        )
+
+        self.log("SYSTEM", "Simulation reset")
+
+    def scenarios(self):
+        result = []
+
+        all_scenarios = self.library.all()
+
+        for scenario_id, builder in all_scenarios.items():
+            try:
+                data = builder()
+
+                result.append({
+                    "id": scenario_id,
+                    "name": data.get(
+                        "name",
+                        scenario_id
+                    ),
+                    "description": data.get(
+                        "description",
+                        ""
+                    )
+                })
+            except Exception:
+                result.append({
+                    "id": scenario_id,
+                    "name": scenario_id,
+                    "description": ""
+                })
+
+        return result
+
+    def load_scenario(self, scenario_id):
+        self.running = False
+        self.scenario_id = scenario_id
+        self.events.clear()
+        self.faults.clear()
+        self.paths.clear()
+
+        data = self.library.get(scenario_id)
+
+        if not data:
+            raise ValueError(
+                f"Unknown scenario: {scenario_id}"
+            )
+
+        obstacles = list(
+            data.get("obstacles", [])
+        )
+
+        self._create(obstacles)
+
+        for robot in data.get("robots", []):
+            self.sim.add_robot(
+                robot["id"],
+                robot["x"],
+                robot["y"],
+                robot.get("theta", 0.0),
+                robot.get("battery", 100.0)
+            )
+
+        for task in data.get("tasks", []):
+            if isinstance(task, Task):
+                self.sim.add_task(task)
+            else:
+                self.sim.add_task(
+                    Task(
+                        task["id"],
+                        tuple(task["start"]),
+                        tuple(task["destination"]),
+                        task.get("assigned_robot")
+                    )
+                )
+
+        self.log(
+            "SCENARIO",
+            f"Loaded {scenario_id}"
+        )
+
+    def start(self):
+        if self.running:
+            return
+
+        self.running = True
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            if (
+                self.loop_task is None
+                or self.loop_task.done()
+            ):
+                self.loop_task = loop.create_task(
+                    self._run_loop()
+                )
+
+        except RuntimeError:
+            pass
+
+        self.log(
+            "SYSTEM",
+            "Simulation started"
+        )
+
+    def stop(self):
+        self.running = False
+
+        for robot in self.sim.robots.values():
+            robot.vx = 0.0
+            robot.vy = 0.0
+
+        self.log(
+            "SYSTEM",
+            "Simulation stopped"
+        )
+
+    async def _run_loop(self):
+        while self.running:
+            self.step()
+            await asyncio.sleep(0.1)
+
+    def step(self):
+        if not self.running:
+            return
+
+        self._update_peers()
+
+        commands = {}
+
+        for robot_id, robot in self.sim.robots.items():
+
+            if not robot.active:
+                continue
+
+            task = self._get_task(robot_id)
+
+            if not task:
+                commands[robot_id] = MotionCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    True
+                )
+                continue
+
+            if task.status == TaskStatus.PENDING:
+                task.activate()
+
+            goal = task.destination
+
+            current = self.grid.to_cell(
+                robot.x,
+                robot.y
+            )
+
+            if current == goal:
+                commands[robot_id] = MotionCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    True
+                )
+                continue
+
+            path = self.paths.get(robot_id)
+
+            if (
+                not path
+                or current not in path
+            ):
+                path = self.engine.plan_robot(
+                    robot_id,
+                    current,
+                    goal
+                )
+
+                self.paths[robot_id] = path
+
+            if not path:
+                task.fail()
+
+                self.log(
+                    robot_id,
+                    f"Task {task.id}: no path"
+                )
+
+                commands[robot_id] = MotionCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    True
+                )
+
+                continue
+
+            try:
+                index = path.index(current)
+            except ValueError:
+                index = 0
+
+            if index + 1 >= len(path):
+                target = goal
+            else:
+                target = path[index + 1]
+
+            tx, ty = self.grid.to_position(
+                target[0],
+                target[1]
+            )
+
+            dx = tx - robot.x
+            dy = ty - robot.y
+
+            d = sqrt(dx * dx + dy * dy)
+
+            if d < 0.08:
+                robot.x = tx
+                robot.y = ty
+
+                commands[robot_id] = MotionCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    True
+                )
+
+                continue
+
+            vx = dx / d
+            vy = dy / d
+
+            peers = self._get_peers(
+                robot_id
+            )
+
+            for peer in peers:
+                self.engine.set_peer_state(
+                    peer["id"],
+                    peer["x"],
+                    peer["y"],
+                    peer["vx"],
+                    peer["vy"]
+                )
+
+            nearest = self._nearest_distance(
+                robot,
+                peers
+            )
+
+            level, command = (
+                self.engine.command_for_distance(
+                    robot_id,
+                    nearest,
+                    vx,
+                    vy
+                )
+            )
+
+            commands[robot_id] = command
+
+        self.sim.step(commands)
+
+        self._check_tasks()
+        self._check_safety()
+
+    def _update_peers(self):
+        for robot_id, robot in self.sim.robots.items():
+
+            if not robot.active:
+                continue
+
+            for other_id, other in self.sim.robots.items():
+
+                if (
+                    other_id == robot_id
+                    or not other.active
+                ):
+                    continue
+
+                self.engine.set_peer_state(
+                    other_id,
+                    other.x,
+                    other.y,
+                    other.vx,
+                    other.vy
+                )
+
+    def _get_peers(self, robot_id):
+        result = []
+
+        for other_id, robot in self.sim.robots.items():
+
+            if (
+                other_id == robot_id
+                or not robot.active
+            ):
+                continue
+
+            result.append({
+                "id": other_id,
+                "x": robot.x,
+                "y": robot.y,
+                "vx": robot.vx,
+                "vy": robot.vy
+            })
+
+        return result
+
+    def _nearest_distance(self, robot, peers):
+        if not peers:
+            return float("inf")
+
+        best = float("inf")
+
+        for peer in peers:
+            dx = robot.x - peer["x"]
+            dy = robot.y - peer["y"]
+
+            d = sqrt(
+                dx * dx +
+                dy * dy
+            )
+
+            if d < best:
+                best = d
+
+        return best
+
+    def _get_task(self, robot_id):
+        for task in self.sim.tasks.values():
+
+            if (
+                task.assigned_robot == robot_id
+                and not task.completed
+                and task.status != TaskStatus.FAILED
+            ):
+                return task
+
+        return None
+
+    def _check_tasks(self):
+        for task in self.sim.tasks.values():
+
+            if (
+                task.completed
+                or not task.assigned_robot
+            ):
+                continue
+
+            robot = self.sim.get_robot(
+                task.assigned_robot
+            )
+
+            if not robot or not robot.active:
+                continue
+
+            cell = self.grid.to_cell(
+                robot.x,
+                robot.y
+            )
+
+            if cell == task.destination:
+                task.complete()
+
+                self.paths.pop(
+                    robot.id,
+                    None
+                )
+
+                self.log(
+                    robot.id,
+                    f"Task {task.id} completed"
+                )
+
+        if (
+            self.sim.tasks
+            and all(
+                task.completed
+                for task in self.sim.tasks.values()
+            )
+        ):
+            self.running = False
+
+            self.log(
+                "SYSTEM",
+                "All tasks completed"
+            )
+
+    def _check_safety(self):
+        robots = [
+            r for r in self.sim.robots.values()
+            if r.active
+        ]
+
+        for i in range(len(robots)):
+            for j in range(i + 1, len(robots)):
+
+                a = robots[i]
+                b = robots[j]
+
+                dx = a.x - b.x
+                dy = a.y - b.y
+
+                d = sqrt(
+                    dx * dx +
+                    dy * dy
+                )
+
+                ra = self.specs[a.id].radius
+                rb = self.specs[b.id].radius
+
+                if d <= ra + rb:
+                    self.log(
+                        "SAFETY",
+                        f"COLLISION {a.id}/{b.id}"
+                    )
+
+    def add_task(self, data):
+        task = Task(
+            data["id"],
+            tuple(data["start"]),
+            tuple(data["destination"]),
+            data.get("assigned_robot")
+        )
+
+        self.sim.add_task(task)
+
+        self.log(
+            "TASK",
+            f"Added {task.id}"
+        )
+
+        return {
+            "ok": True,
+            "task": task.id
+        }
+
+    def assign_task(self, task_id, robot_id):
+        task = self.sim.tasks.get(task_id)
+
+        if not task:
+            return {
+                "ok": False,
+                "error": "Task not found"
+            }
+
+        if robot_id not in self.sim.robots:
+            return {
+                "ok": False,
+                "error": "Robot not found"
+            }
+
+        task.assigned_robot = robot_id
+        task.status = TaskStatus.PENDING
+        task.completed = False
+
+        self.paths.pop(
+            robot_id,
+            None
+        )
+
+        self.log(
+            "TASK",
+            f"{task_id} assigned to {robot_id}"
+        )
+
+        return {"ok": True}
+
+    def add_fault(self, data):
+        kind = data.get("kind")
+
+        if kind == "robot_failure":
+
+            robot_id = data.get("target")
+
+            self.faults.kill_robot(
+                robot_id
+            )
+
+            robot = self.sim.get_robot(
+                robot_id
+            )
+
+            if robot:
+                self.sim.kill_robot(
+                    robot_id
+                )
+
+            self.log(
+                "FAULT",
+                f"Robot {robot_id} failed"
+            )
+
+        elif kind == "blocked_cell":
+
+            x = int(data["x"])
+            y = int(data["y"])
+
+            self.faults.blocked_cell(
+                x,
+                y
+            )
+
+            obstacle = Obstacle(x, y)
+
+            if obstacle not in self.sim.obstacles:
+                self.sim.obstacles.append(
+                    obstacle
+                )
+
+            self.paths.clear()
+
+            self.log(
+                "FAULT",
+                f"Blocked cell ({x},{y})"
+            )
+
+        elif kind == "wifi_dead_zone":
+
+            x = int(data["x"])
+            y = int(data["y"])
+
+            self.faults.wifi_dead_zone(
+                x,
+                y
+            )
+
+            self.log(
+                "FAULT",
+                f"Wi-Fi dead zone ({x},{y})"
+            )
+
+        return {"ok": True}
+
+    def log(self, source, message):
+        self.events.append({
+            "time": round(
+                self.sim.time,
+                2
+            ),
+            "source": source,
+            "message": message
+        })
+
+        if len(self.events) > 200:
+            self.events = self.events[-200:]
+
+    def state(self):
+        robots = []
+
+        for robot in self.sim.robots.values():
+
+            task = self._get_task(
+                robot.id
+            )
+
+            robots.append({
+                "id": robot.id,
+                "x": robot.x,
+                "y": robot.y,
+                "theta": robot.theta,
+                "vx": robot.vx,
+                "vy": robot.vy,
+                "battery": robot.battery,
+                "active": robot.active,
+                "task_id":
+                    task.id if task else None
+            })
+
+        tasks = []
+
+        for task in self.sim.tasks.values():
+
+            tasks.append({
+                "id": task.id,
+                "start": list(task.start),
+                "destination":
+                    list(task.destination),
+                "assigned_robot":
+                    task.assigned_robot,
+                "completed":
+                    task.completed,
+                "status":
+                    task.status.value
+            })
+
+        obstacles = [
+            {
+                "x": obstacle.x,
+                "y": obstacle.y
+            }
+            for obstacle in self.sim.obstacles
+        ]
+
+        return {
+            "time": round(
+                self.sim.time,
+                2
+            ),
+            "running": self.running,
+            "scenario": self.scenario_id,
+            "grid": {
+                "width": self.grid.width,
+                "height": self.grid.height,
+                "cell_size":
+                    self.grid.cell_size
+            },
+            "robots": robots,
+            "tasks": tasks,
+            "obstacles": obstacles,
+            "events":
+                self.events[-100:]
+        }
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_api\__init__.py ================
+
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\allocator.py ================
+
+from abc import ABC, abstractmethod
+
+
+class TaskAllocator(ABC):
+
+    @abstractmethod
+    def assign(self, tasks, robots):
+        pass
+
+
+class ManualAllocator(TaskAllocator):
+
+    def assign(self, tasks, robots):
+        return tasks
+
+
+class CentralAllocator(TaskAllocator):
+
+    def assign(self, tasks, robots):
+        available = [
+            r
+            for r in robots
+            if robots[r].active
+        ]
+
+        for task in tasks:
+            if task.assigned_robot:
+                continue
+
+            if not available:
+                break
+
+            task.assigned_robot = available[0]
+
+        return tasks
+
+
+class ContractNetAllocator(TaskAllocator):
+
+    def assign(self, tasks, robots):
+        available = [
+            r
+            for r in robots
+            if robots[r].active
+        ]
+
+        for task in tasks:
+            if task.assigned_robot:
+                continue
+
+            if not available:
+                break
+
+            best = available[0]
+            best_battery = robots[best].battery
+
+            for robot_id in available:
+                if robots[robot_id].battery > best_battery:
+                    best = robot_id
+                    best_battery = robots[robot_id].battery
+
+            task.assigned_robot = best
+
+        return tasks
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\arbiter.py ================
+
+from .intent import RobotIntent
+
+
+class ConflictArbiter:
+
+    def decide(self, a: RobotIntent, b: RobotIntent):
+
+        if a.wait_time != b.wait_time:
+            return a if a.wait_time > b.wait_time else b
+
+        if a.logical_clock != b.logical_clock:
+            return a if a.logical_clock < b.logical_clock else b
+
+        return a if a.id < b.id else b
+
+    def compare(self, a: RobotIntent, b: RobotIntent):
+        winner = self.decide(a, b)
+
+        if winner.id == a.id:
+            return 1
+
+        return -1
+
+    def highest_priority(self, intents):
+        if not intents:
+            return None
+
+        winner = intents[0]
+
+        for intent in intents[1:]:
+            winner = self.decide(winner, intent)
+
+        return winner
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\avoidance.py ================
+
+from dataclasses import dataclass
+from math import sqrt, atan2
+
+
+@dataclass
+class AvoidanceResult:
+    vx: float
+    vy: float
+    omega: float
+    changed: bool
+
+
+class LocalAvoidance:
+
+    def __init__(self, time_horizon=2.0, margin=0.1):
+        self.time_horizon = time_horizon
+        self.margin = margin
+
+    def avoid(
+        self,
+        x,
+        y,
+        vx,
+        vy,
+        peers
+    ):
+        rvx = vx
+        rvy = vy
+        changed = False
+
+        for peer in peers:
+            dx = peer["x"] - x
+            dy = peer["y"] - y
+
+            d = sqrt(dx * dx + dy * dy)
+
+            if d <= 0:
+                continue
+
+            pvx = peer.get("vx", 0.0)
+            pvy = peer.get("vy", 0.0)
+
+            rel_vx = pvx - rvx
+            rel_vy = pvy - rvy
+
+            closing = dx * rel_vx + dy * rel_vy
+
+            if closing >= 0:
+                continue
+
+            closing_speed = -closing / d
+
+            if closing_speed <= 0:
+                continue
+
+            t = d / closing_speed
+
+            if t > self.time_horizon:
+                continue
+
+            nx = -dy / d
+            ny = dx / d
+
+            cross = dx * rel_vy - dy * rel_vx
+
+            if cross > 0:
+                nx = -nx
+                ny = -ny
+
+            strength = (
+                self.time_horizon - t
+            ) / self.time_horizon
+
+            shift = max(
+                0.1,
+                strength
+            )
+
+            rvx += nx * shift
+            rvy += ny * shift
+
+            changed = True
+
+        speed = sqrt(
+            rvx * rvx +
+            rvy * rvy
+        )
+
+        omega = 0.0
+
+        if speed > 0:
+            omega = atan2(rvy, rvx)
+
+        return AvoidanceResult(
+            rvx,
+            rvy,
+            omega,
+            changed
+        )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\baseline.py ================
+
+from math import sqrt
+
+
+class StopAndWaitBaseline:
+
+    def __init__(self, distance_threshold):
+        self.distance_threshold = distance_threshold
+
+    def command(
+        self,
+        robot,
+        vx,
+        vy,
+        peers
+    ):
+        for peer in peers:
+
+            dx = peer.x - robot.x
+            dy = peer.y - robot.y
+
+            d = sqrt(
+                dx * dx +
+                dy * dy
+            )
+
+            if d <= self.distance_threshold:
+                return 0.0, 0.0
+
+        return vx, vy
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\cell.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Cell:
+    x: int
+    y: int
+
+    def multicast_group(self):
+        return f"239.1.{self.y % 256}.{self.x % 256}"
+
+    def neighbors(self):
+        cells = []
+
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                cells.append(
+                    Cell(
+                        self.x + dx,
+                        self.y + dy
+                    )
+                )
+
+        return cells
+
+    def is_neighbor(self, other):
+        return (
+            abs(self.x - other.x) <= 1
+            and abs(self.y - other.y) <= 1
+        )
+
+
+def cell_from_position(x, y, cell_size):
+    return Cell(
+        int(x / cell_size),
+        int(y / cell_size)
+    )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\clock.py ================
+
+class LamportClock:
+    def __init__(self):
+        self.value = 0
+
+    def tick(self):
+        self.value += 1
+        return self.value
+
+    def receive(self, other):
+        self.value = max(self.value, other) + 1
+        return self.value
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\config.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class SafetyConfig:
+    reaction_latency: float = 0.1
+    margin: float = 0.1
+
+
+@dataclass
+class LivenessConfig:
+    warning_timeout: float = 1.0
+    failure_timeout: float = 3.0
+    margin: float = 0.1
+
+
+@dataclass
+class NetworkConfig:
+    cell_size: float = 10.0
+    heartbeat_frequency: float = 1.0
+    local_frequency: float = 10.0
+
+
+@dataclass
+class ArcnetConfig:
+    safety: SafetyConfig
+    liveness: LivenessConfig
+    network: NetworkConfig
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\conflict.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Conflict:
+    robot_a: str
+    robot_b: str
+    position: tuple[int, int]
+    time: int
+    kind: str
+
+
+class ConflictDetector:
+
+    def detect(self, robot_id, path, peer_paths):
+        conflicts = []
+
+        for peer_id, peer_path in peer_paths.items():
+
+            if peer_id == robot_id:
+                continue
+
+            n = min(len(path), len(peer_path))
+
+            for t in range(n):
+
+                if path[t] == peer_path[t]:
+                    conflicts.append(
+                        Conflict(
+                            robot_id,
+                            peer_id,
+                            path[t],
+                            t,
+                            "vertex"
+                        )
+                    )
+
+                if t > 0:
+                    if (
+                        path[t] == peer_path[t - 1]
+                        and
+                        path[t - 1] == peer_path[t]
+                    ):
+                        conflicts.append(
+                            Conflict(
+                                robot_id,
+                                peer_id,
+                                path[t],
+                                t,
+                                "edge"
+                            )
+                        )
+
+        return conflicts
+
+    def has_conflict(self, robot_id, path, peer_paths):
+        return bool(
+            self.detect(
+                robot_id,
+                path,
+                peer_paths
+            )
+        )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\deadlock.py ================
+
+class WaitForGraph:
+
+    def __init__(self):
+        self.waiting = {}
+
+    def add_wait(self, robot_id, waiting_for):
+        self.waiting[robot_id] = waiting_for
+
+    def remove_wait(self, robot_id):
+        self.waiting.pop(robot_id, None)
+
+    def clear(self):
+        self.waiting.clear()
+
+    def has_deadlock(self):
+        return self.get_cycle() is not None
+
+    def get_cycle(self):
+        for start in self.waiting:
+
+            seen = set()
+            cur = start
+
+            while cur in self.waiting:
+
+                if cur in seen:
+                    cycle = []
+                    node = cur
+
+                    while True:
+                        cycle.append(node)
+                        node = self.waiting[node]
+
+                        if node == cur:
+                            break
+
+                    return cycle
+
+                seen.add(cur)
+                cur = self.waiting[cur]
+
+        return None
+
+    def choose_victim(self, intents, arbiter):
+        cycle = self.get_cycle()
+
+        if not cycle:
+            return None
+
+        cycle_intents = [
+            intent
+            for intent in intents
+            if intent.id in cycle
+        ]
+
+        if not cycle_intents:
+            return None
+
+        winner = arbiter.highest_priority(cycle_intents)
+
+        if not winner:
+            return None
+
+        return next(
+            intent
+            for intent in cycle_intents
+            if intent.id != winner.id
+        )
+
+    def dependencies(self):
+        return dict(self.waiting)
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\decision.py ================
+
+from dataclasses import dataclass
+
+from .motion import MotionCommand
+
+
+@dataclass
+class CoordinationDecision:
+    robot_id: str
+    path: list
+    command: MotionCommand
+    waiting_for: str | None = None
+    conflict: object | None = None
+    deadlock: bool = False
+    victim: str | None = None
+    replan: bool = False
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\engine.py ================
+
+from .planner import PathPlanner
+from .arbiter import ConflictArbiter
+from .conflict import ConflictDetector
+from .deadlock import WaitForGraph
+from .motion import MotionController
+from .safety import get_safety_level, SafetyLevel
+from .decision import CoordinationDecision
+from .avoidance import LocalAvoidance
+
+
+class ArcnetEngine:
+
+    def __init__(
+        self,
+        robot_specs,
+        grid,
+        obstacles,
+        safety_config
+    ):
+        self.robot_specs = robot_specs
+        self.grid = grid
+        self.obstacles = obstacles
+        self.safety_config = safety_config
+
+        self.planner = PathPlanner()
+        self.arbiter = ConflictArbiter()
+        self.detector = ConflictDetector()
+        self.graph = WaitForGraph()
+        self.motion = MotionController()
+        self.avoidance = LocalAvoidance(
+            margin=safety_config.margin
+        )
+
+        self.paths = {}
+        self.intents = {}
+        self.peer_states = {}
+
+    def set_intent(self, intent):
+        self.intents[intent.id] = intent
+
+    def set_path(self, robot_id, path):
+        self.paths[robot_id] = path
+
+    def set_peer_state(
+        self,
+        robot_id,
+        x,
+        y,
+        vx=0.0,
+        vy=0.0
+    ):
+        self.peer_states[robot_id] = {
+            "x": x,
+            "y": y,
+            "vx": vx,
+            "vy": vy
+        }
+
+    def remove_robot(self, robot_id):
+        self.paths.pop(robot_id, None)
+        self.intents.pop(robot_id, None)
+        self.peer_states.pop(robot_id, None)
+        self.graph.remove_wait(robot_id)
+
+    def plan_robot(
+        self,
+        robot_id,
+        start,
+        goal
+    ):
+        peer_paths = {
+            rid: path
+            for rid, path in self.paths.items()
+            if rid != robot_id
+        }
+
+        path = self.planner.plan_predictive(
+            start,
+            goal,
+            self.obstacles,
+            self.grid,
+            peer_paths
+        )
+
+        self.paths[robot_id] = path
+
+        return path
+
+    def detect_robot_conflicts(self, robot_id):
+        path = self.paths.get(robot_id, [])
+
+        peer_paths = {
+            rid: path
+            for rid, path in self.paths.items()
+            if rid != robot_id
+        }
+
+        return self.detector.detect(
+            robot_id,
+            path,
+            peer_paths
+        )
+
+    def resolve_conflicts(self, robot_id):
+        conflicts = self.detect_robot_conflicts(robot_id)
+
+        if not conflicts:
+            self.graph.remove_wait(robot_id)
+            return None
+
+        conflict = conflicts[0]
+
+        a = self.intents.get(robot_id)
+        b = self.intents.get(conflict.robot_b)
+
+        if not a or not b:
+            self.graph.add_wait(
+                robot_id,
+                conflict.robot_b
+            )
+            return conflict.robot_b
+
+        winner = self.arbiter.decide(a, b)
+
+        if winner.id == robot_id:
+            self.graph.remove_wait(robot_id)
+            return None
+
+        self.graph.add_wait(
+            robot_id,
+            conflict.robot_b
+        )
+
+        return conflict.robot_b
+
+    def detect_deadlock(self):
+        return self.graph.get_cycle()
+
+    def resolve_deadlock(self):
+        cycle = self.detect_deadlock()
+
+        if not cycle:
+            return None
+
+        intents = [
+            self.intents[rid]
+            for rid in cycle
+            if rid in self.intents
+        ]
+
+        victim = self.graph.choose_victim(
+            intents,
+            self.arbiter
+        )
+
+        if not victim:
+            return None
+
+        self.graph.remove_wait(victim.id)
+
+        return victim.id
+
+    def command_for_distance(
+        self,
+        robot_id,
+        distance,
+        vx,
+        vy,
+        omega=0.0
+    ):
+        robot = self.robot_specs[robot_id]
+
+        level = get_safety_level(
+            distance,
+            robot,
+            self.safety_config
+        )
+
+        if level == SafetyLevel.HARD_STOP:
+            return level, self.motion.hard_stop()
+
+        if level == SafetyLevel.CAUTION:
+            peers = list(self.peer_states.values())
+
+            result = self.avoidance.avoid(
+                0.0,
+                0.0,
+                vx,
+                vy,
+                peers
+            )
+
+            return level, self.motion.normal(
+                result.vx,
+                result.vy,
+                result.omega
+            )
+
+        return level, self.motion.normal(
+            vx,
+            vy,
+            omega
+        )
+
+    def step(
+        self,
+        robot_id,
+        start,
+        goal,
+        distance,
+        vx,
+        vy,
+        omega=0.0
+    ):
+        path = self.plan_robot(
+            robot_id,
+            start,
+            goal
+        )
+
+        waiting_for = self.resolve_conflicts(
+            robot_id
+        )
+
+        deadlock = False
+        victim = None
+        replan = False
+
+        if self.detect_deadlock():
+            deadlock = True
+
+            victim = self.resolve_deadlock()
+
+            if victim == robot_id:
+                replan = True
+                waiting_for = None
+
+        level, command = self.command_for_distance(
+            robot_id,
+            distance,
+            vx,
+            vy,
+            omega
+        )
+
+        if waiting_for and level != SafetyLevel.HARD_STOP:
+            command = self.motion.hard_stop()
+
+        return CoordinationDecision(
+            robot_id=robot_id,
+            path=path,
+            command=command,
+            waiting_for=waiting_for,
+            deadlock=deadlock,
+            victim=victim,
+            replan=replan
+        )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\events.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Event:
+    time: float
+    kind: str
+    robot_id: str | None = None
+    task_id: str | None = None
+    peer_id: str | None = None
+    data: dict | None = None
+
+
+class EventLog:
+
+    def __init__(self):
+        self.events = []
+
+    def add(
+        self,
+        time,
+        kind,
+        robot_id=None,
+        task_id=None,
+        peer_id=None,
+        data=None
+    ):
+        self.events.append(
+            Event(
+                time,
+                kind,
+                robot_id,
+                task_id,
+                peer_id,
+                data or {}
+            )
+        )
+
+    def all(self):
+        return list(self.events)
+
+    def clear(self):
+        self.events.clear()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\faults.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Fault:
+    kind: str
+    target: str | None = None
+    x: int | None = None
+    y: int | None = None
+    active: bool = True
+
+
+class FaultManager:
+    def __init__(self):
+        self.faults = []
+
+    def add(self, fault):
+        self.faults.append(fault)
+
+    def remove(self, fault):
+        if fault in self.faults:
+            self.faults.remove(fault)
+
+    def clear(self):
+        self.faults.clear()
+
+    def kill_robot(self, robot_id):
+        self.add(
+            Fault(
+                "robot_failure",
+                target=robot_id
+            )
+        )
+
+    def wifi_dead_zone(self, x, y):
+        self.add(
+            Fault(
+                "wifi_dead_zone",
+                x=x,
+                y=y
+            )
+        )
+
+    def blocked_cell(self, x, y):
+        self.add(
+            Fault(
+                "blocked_cell",
+                x=x,
+                y=y
+            )
+        )
+
+    def is_wifi_blocked(self, x, y):
+        return any(
+            f.active
+            and f.kind == "wifi_dead_zone"
+            and f.x == x
+            and f.y == y
+            for f in self.faults
+        )
+
+    def blocked_cells(self):
+        return [
+            (f.x, f.y)
+            for f in self.faults
+            if f.active
+            and f.kind == "blocked_cell"
+        ]
+
+    def failed_robots(self):
+        return [
+            f.target
+            for f in self.faults
+            if f.active
+            and f.kind == "robot_failure"
+        ]
+
+    def is_robot_failed(self, robot_id):
+        return robot_id in self.failed_robots()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\fleet.py ================
+
+from math import sqrt
+
+from .motion import MotionCommand
+from .metrics import Metrics
+from .obstacle import Obstacle
+
+
+class FleetRunner:
+
+    def __init__(
+        self,
+        simulator,
+        engine,
+        max_steps=5000,
+        fault_manager=None
+    ):
+        self.sim = simulator
+        self.engine = engine
+        self.max_steps = max_steps
+        self.fault_manager = fault_manager
+        self.metrics = Metrics()
+        self.failed_tasks = set()
+
+    def run(self, max_steps=None):
+        if max_steps is None:
+            max_steps = self.max_steps
+
+        for _ in range(max_steps):
+
+            self._apply_faults()
+            self._recover_failed_robots()
+
+            if self._all_tasks_complete():
+                self.metrics.completion_time = self.sim.time
+                return self.metrics
+
+            self._update_peers()
+
+            commands = {}
+
+            for robot_id, robot in self.sim.robots.items():
+
+                if not robot.active:
+                    continue
+
+                task = self._get_task(robot_id)
+
+                if not task:
+                    commands[robot_id] = MotionCommand(
+                        0.0,
+                        0.0,
+                        0.0,
+                        True
+                    )
+                    continue
+
+                if task.status.value == "pending":
+                    task.activate()
+
+                start = self.sim.grid.to_cell(
+                    robot.x,
+                    robot.y
+                )
+
+                path = self.engine.plan_robot(
+                    robot_id,
+                    start,
+                    task.destination
+                )
+
+                if not path:
+                    self._handle_plan_failure(task)
+                    continue
+
+                self.metrics.record_replan()
+
+                target = path[1] if len(path) > 1 else path[0]
+
+                dx = target[0] - robot.x
+                dy = target[1] - robot.y
+
+                d = sqrt(dx * dx + dy * dy)
+
+                if d > 0:
+                    vx = dx / d
+                    vy = dy / d
+                else:
+                    vx = 0.0
+                    vy = 0.0
+
+                peers = self._get_peers(robot_id)
+
+                for peer in peers:
+                    self.engine.set_peer_state(
+                        peer["id"],
+                        peer["x"],
+                        peer["y"],
+                        peer["vx"],
+                        peer["vy"]
+                    )
+
+                nearest = self._nearest_distance(
+                    robot,
+                    peers
+                )
+
+                level, command = self.engine.command_for_distance(
+                    robot_id,
+                    nearest,
+                    vx,
+                    vy
+                )
+
+                if command.stop:
+                    self.metrics.record_stop()
+                    self.metrics.event(
+                        "robot_stop",
+                        time=self.sim.time,
+                        robot_id=robot_id
+                    )
+
+                commands[robot_id] = command
+
+            self.sim.step(commands)
+
+            self._check_safety()
+            self._check_tasks()
+
+        self.metrics.completion_time = self.sim.time
+        return self.metrics
+
+    def _apply_faults(self):
+        if not self.fault_manager:
+            return
+
+        for robot_id in self.fault_manager.failed_robots():
+            robot = self.sim.get_robot(robot_id)
+
+            if robot and robot.active:
+                self.sim.kill_robot(robot_id)
+
+                self.engine.remove_robot(robot_id)
+
+                self.metrics.event(
+                    "robot_failure",
+                    time=self.sim.time,
+                    robot_id=robot_id
+                )
+
+        blocked = self.fault_manager.blocked_cells()
+
+        existing = {
+            (o.x, o.y)
+            for o in self.sim.obstacles
+        }
+
+        for x, y in blocked:
+            if (x, y) not in existing:
+                self.sim.obstacles.append(
+                    Obstacle(x, y, True)
+                )
+
+        blocked_set = set(blocked)
+
+        self.sim.obstacles[:] = [
+            o
+            for o in self.sim.obstacles
+            if not o.temporary
+            or (o.x, o.y) in blocked_set
+        ]
+
+        self.engine.obstacles = self.sim.obstacles
+
+    def _recover_failed_robots(self):
+        for task in self.sim.tasks.values():
+
+            if task.completed:
+                continue
+
+            robot_id = task.assigned_robot
+
+            if not robot_id:
+                continue
+
+            robot = self.sim.get_robot(robot_id)
+
+            if robot and robot.active:
+                continue
+
+            task.release()
+
+            self.metrics.event(
+                "task_requeued",
+                time=self.sim.time,
+                task_id=task.id
+            )
+
+            self._assign_requeued_task(task)
+
+    def _assign_requeued_task(self, task):
+        available = [
+            robot_id
+            for robot_id, robot in self.sim.robots.items()
+            if robot.active
+        ]
+
+        if not available:
+            return
+
+        best = available[0]
+
+        best_score = self._task_score(
+            task,
+            best
+        )
+
+        for robot_id in available[1:]:
+
+            score = self._task_score(
+                task,
+                robot_id
+            )
+
+            if score < best_score:
+                best = robot_id
+                best_score = score
+
+        task.assigned_robot = best
+
+        self.metrics.event(
+            "task_reassigned",
+            time=self.sim.time,
+            task_id=task.id,
+            robot_id=best
+        )
+
+    def _task_score(self, task, robot_id):
+        robot = self.sim.get_robot(robot_id)
+
+        if not robot:
+            return float("inf")
+
+        dx = robot.x - task.start[0]
+        dy = robot.y - task.start[1]
+
+        distance = sqrt(
+            dx * dx +
+            dy * dy
+        )
+
+        battery_penalty = max(
+            0.0,
+            100.0 - robot.battery
+        )
+
+        return distance + battery_penalty * 0.01
+
+    def _handle_plan_failure(self, task):
+        if task.id in self.failed_tasks:
+            return
+
+        task.fail()
+
+        self.failed_tasks.add(task.id)
+
+        self.metrics.tasks_failed += 1
+
+        self.metrics.event(
+            "plan_failure",
+            time=self.sim.time,
+            task_id=task.id
+        )
+
+    def _update_peers(self):
+        for robot_id, robot in self.sim.robots.items():
+
+            if not robot.active:
+                continue
+
+            for other_id, other in self.sim.robots.items():
+
+                if other_id == robot_id:
+                    continue
+
+                if not other.active:
+                    continue
+
+                self.engine.set_peer_state(
+                    other_id,
+                    other.x,
+                    other.y,
+                    other.vx,
+                    other.vy
+                )
+
+    def _get_peers(self, robot_id):
+        result = []
+
+        for other_id, robot in self.sim.robots.items():
+
+            if other_id == robot_id:
+                continue
+
+            if not robot.active:
+                continue
+
+            result.append({
+                "id": other_id,
+                "x": robot.x,
+                "y": robot.y,
+                "vx": robot.vx,
+                "vy": robot.vy
+            })
+
+        return result
+
+    def _nearest_distance(self, robot, peers):
+        if not peers:
+            return float("inf")
+
+        best = float("inf")
+
+        for peer in peers:
+
+            dx = robot.x - peer["x"]
+            dy = robot.y - peer["y"]
+
+            d = sqrt(
+                dx * dx +
+                dy * dy
+            )
+
+            if d < best:
+                best = d
+
+        return best
+
+    def _get_task(self, robot_id):
+        for task in self.sim.tasks.values():
+
+            if (
+                task.assigned_robot == robot_id
+                and not task.completed
+                and task.status.value != "failed"
+            ):
+                return task
+
+        return None
+
+    def _all_tasks_complete(self):
+        if not self.sim.tasks:
+            return False
+
+        return all(
+            task.completed
+            for task in self.sim.tasks.values()
+        )
+
+    def _check_tasks(self):
+        for task in self.sim.tasks.values():
+
+            if task.completed:
+                continue
+
+            if not task.assigned_robot:
+                continue
+
+            robot = self.sim.get_robot(
+                task.assigned_robot
+            )
+
+            if not robot or not robot.active:
+                continue
+
+            cell = self.sim.grid.to_cell(
+                robot.x,
+                robot.y
+            )
+
+            if cell == task.destination:
+
+                task.complete()
+
+                self.metrics.tasks_completed += 1
+
+                self.metrics.event(
+                    "task_completed",
+                    time=self.sim.time,
+                    task_id=task.id,
+                    robot_id=robot.id
+                )
+
+    def _check_safety(self):
+        robots = [
+            r
+            for r in self.sim.robots.values()
+            if r.active
+        ]
+
+        for i in range(len(robots)):
+
+            for j in range(i + 1, len(robots)):
+
+                a = robots[i]
+                b = robots[j]
+
+                dx = a.x - b.x
+                dy = a.y - b.y
+
+                d = sqrt(
+                    dx * dx +
+                    dy * dy
+                )
+
+                ra = self.engine.robot_specs[
+                    a.id
+                ].radius
+
+                rb = self.engine.robot_specs[
+                    b.id
+                ].radius
+
+                collision_distance = ra + rb
+
+                if d <= collision_distance:
+
+                    self.metrics.record_collision()
+
+                    self.metrics.event(
+                        "collision",
+                        time=self.sim.time,
+                        robot_a=a.id,
+                        robot_b=b.id
+                    )
+
+                elif d <= collision_distance + 0.2:
+
+                    self.metrics.record_near_miss()
+
+                    self.metrics.event(
+                        "near_miss",
+                        time=self.sim.time,
+                        robot_a=a.id,
+                        robot_b=b.id
+                    )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\geometry.py ================
+
+from dataclasses import dataclass
+from math import sqrt
+
+
+@dataclass
+class Footprint:
+    shape: str
+    length: float
+    width: float
+
+    @classmethod
+    def from_robot(cls, robot):
+        return cls(
+            robot.shape,
+            robot.length,
+            robot.width
+        )
+
+    @property
+    def radius(self):
+        if self.shape == "circle":
+            return self.width / 2
+
+        return sqrt(
+            (self.length / 2) ** 2 +
+            (self.width / 2) ** 2
+        )
+
+    def validate(self):
+        if self.shape not in ("rectangle", "circle"):
+            raise ValueError("Invalid footprint shape")
+
+        if self.length <= 0 or self.width <= 0:
+            raise ValueError(
+                "Footprint dimensions must be positive"
+            )
+
+
+def distance(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+
+    return sqrt(dx * dx + dy * dy)
+
+
+def surface_gap(
+    a,
+    b,
+    footprint_a,
+    footprint_b
+):
+    return max(
+        0.0,
+        distance(a, b)
+        - footprint_a.radius
+        - footprint_b.radius
+    )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\grid.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Grid:
+    width: int
+    height: int
+    cell_size: float
+
+    def validate(self):
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("Grid dimensions must be positive")
+
+        if self.cell_size <= 0:
+            raise ValueError("Cell size must be positive")
+
+    def to_cell(self, x, y):
+        return int(x / self.cell_size), int(y / self.cell_size)
+
+    def to_position(self, x, y):
+        return (
+            (x + 0.5) * self.cell_size,
+            (y + 0.5) * self.cell_size
+        )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\intent.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class RobotIntent:
+    id: str
+    logical_clock: int
+    wait_time: float
+    x: float
+    y: float
+    vx: float
+    vy: float
+    theta: float
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\message.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class RobotMessage:
+    sender_id: str
+    logical_clock: int
+    timestamp: float
+    x: float
+    y: float
+    vx: float
+    vy: float
+    theta: float
+    status: int
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\metrics.py ================
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Metrics:
+    completion_time: float = 0.0
+    collisions: int = 0
+    near_misses: int = 0
+    stops: int = 0
+    replans: int = 0
+    deadlocks_detected: int = 0
+    deadlocks_resolved: int = 0
+    tasks_completed: int = 0
+    tasks_failed: int = 0
+    events: list = field(default_factory=list)
+
+    def record_collision(self):
+        self.collisions += 1
+
+    def record_near_miss(self):
+        self.near_misses += 1
+
+    def record_stop(self):
+        self.stops += 1
+
+    def record_replan(self):
+        self.replans += 1
+
+    def record_deadlock(self):
+        self.deadlocks_detected += 1
+
+    def record_deadlock_resolution(self):
+        self.deadlocks_resolved += 1
+
+    def event(self, kind, **data):
+        self.events.append({
+            "time": data.pop("time", 0.0),
+            "kind": kind,
+            **data
+        })
+
+    def as_dict(self):
+        return {
+            "completion_time": self.completion_time,
+            "collisions": self.collisions,
+            "near_misses": self.near_misses,
+            "stops": self.stops,
+            "replans": self.replans,
+            "deadlocks_detected": self.deadlocks_detected,
+            "deadlocks_resolved": self.deadlocks_resolved,
+            "tasks_completed": self.tasks_completed,
+            "tasks_failed": self.tasks_failed
+        }
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\motion.py ================
+
+from dataclasses import dataclass
+
+from .safety import SafetyLevel
+
+
+@dataclass
+class MotionCommand:
+    vx: float
+    vy: float
+    omega: float
+    stop: bool = False
+
+
+class MotionController:
+
+    def normal(self, vx, vy, omega=0.0):
+        return MotionCommand(
+            vx,
+            vy,
+            omega,
+            False
+        )
+
+    def caution(self, vx, vy, omega=0.0):
+        return MotionCommand(
+            vx * 0.5,
+            vy * 0.5,
+            omega,
+            False
+        )
+
+    def hard_stop(self):
+        return MotionCommand(
+            0.0,
+            0.0,
+            0.0,
+            True
+        )
+
+    def command(self, level, vx, vy, omega=0.0):
+        if level == SafetyLevel.HARD_STOP:
+            return self.hard_stop()
+
+        if level == SafetyLevel.CAUTION:
+            return self.caution(
+                vx,
+                vy,
+                omega
+            )
+
+        return self.normal(
+            vx,
+            vy,
+            omega
+        )
+
+
+def safety_command(level):
+    controller = MotionController()
+
+    return controller.command(
+        level,
+        0.0,
+        0.0
+    )
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\obstacle.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Obstacle:
+    x: int
+    y: int
+    temporary: bool = False
+
+
+def is_blocked(obstacles, x, y):
+    return any(o.x == x and o.y == y for o in obstacles)
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\peer.py ================
+
+from dataclasses import dataclass
+from enum import Enum
+from .config import LivenessConfig
+
+
+class PeerStatus(Enum):
+    UNKNOWN = "unknown"
+    ACTIVE = "active"
+    LEFT_NEIGHBORHOOD = "left_neighborhood"
+    SILENT_WARNING = "silent_warning"
+    OUT_OF_RANGE = "out_of_range"
+    PRESUMED_FAILED = "presumed_failed"
+
+
+@dataclass
+class Peer:
+    id: str
+    x: float
+    y: float
+    vx: float
+    vy: float
+    theta: float
+    last_local_broadcast: float
+    last_global_heartbeat: float
+    max_speed: float = 0.0
+    status: PeerStatus = PeerStatus.UNKNOWN
+
+
+class PeerManager:
+    def __init__(self, config):
+        self.config = config
+        self.peers = {}
+
+    def add(self, peer):
+        self.peers[peer.id] = peer
+
+    def update_state(
+        self,
+        robot_id,
+        x,
+        y,
+        vx,
+        vy,
+        theta,
+        now,
+        local=True,
+        global_heartbeat=True
+    ):
+        peer = self.peers.get(robot_id)
+
+        if not peer:
+            peer = Peer(
+                robot_id,
+                x,
+                y,
+                vx,
+                vy,
+                theta,
+                now,
+                now,
+                0.0,
+                PeerStatus.ACTIVE
+            )
+            self.peers[robot_id] = peer
+        else:
+            peer.x = x
+            peer.y = y
+            peer.vx = vx
+            peer.vy = vy
+            peer.theta = theta
+
+            if local:
+                peer.last_local_broadcast = now
+
+            if global_heartbeat:
+                peer.last_global_heartbeat = now
+
+            peer.status = PeerStatus.ACTIVE
+
+        return peer
+
+    def get(self, robot_id):
+        return self.peers.get(robot_id)
+
+    def remove(self, robot_id):
+        self.peers.pop(robot_id, None)
+
+    def uncertainty_radius(self, robot_id, now):
+        peer = self.peers.get(robot_id)
+
+        if not peer:
+            return 0.0
+
+        silence = max(
+            0.0,
+            now - peer.last_local_broadcast
+        )
+
+        return silence * peer.max_speed + self.config.margin
+
+    def update(
+        self,
+        robot_id,
+        now,
+        local_visible,
+        global_visible
+    ):
+        peer = self.peers.get(robot_id)
+
+        if not peer:
+            return None
+
+        local_age = now - peer.last_local_broadcast
+        global_age = now - peer.last_global_heartbeat
+
+        if local_visible:
+            peer.status = PeerStatus.ACTIVE
+        elif global_visible:
+            peer.status = PeerStatus.LEFT_NEIGHBORHOOD
+        elif (
+            local_age > self.config.failure_timeout
+            and global_age > self.config.failure_timeout
+        ):
+            peer.status = PeerStatus.PRESUMED_FAILED
+        elif local_age > self.config.warning_timeout:
+            peer.status = PeerStatus.SILENT_WARNING
+
+        return peer.status
+
+    def update_all(self, now, local_visible):
+        for robot_id in self.peers:
+            self.update(
+                robot_id,
+                now,
+                robot_id in local_visible,
+                True
+            )
+
+    def active_peers(self):
+        return [
+            p for p in self.peers.values()
+            if p.status == PeerStatus.ACTIVE
+        ]
+
+    def failed_peers(self):
+        return [
+            p for p in self.peers.values()
+            if p.status == PeerStatus.PRESUMED_FAILED
+        ]
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\planner.py ================
+
+from heapq import heappush, heappop
+
+
+class PathPlanner:
+
+    def plan(self, start, goal, obstacles, grid):
+        return self._astar(start, goal, obstacles, grid)
+
+    def plan_predictive(
+        self,
+        start,
+        goal,
+        obstacles,
+        grid,
+        peer_paths=None,
+        start_time=0
+    ):
+        peer_paths = peer_paths or {}
+
+        q = []
+        first = (start[0], start[1], start_time)
+
+        heappush(q, (0, first))
+
+        came_from = {}
+        cost = {first: 0}
+
+        while q:
+            _, cur = heappop(q)
+
+            x, y, t = cur
+
+            if (x, y) == goal:
+                return self._build_time_path(came_from, cur)
+
+            nt = t + 1
+
+            moves = (
+                (x + 1, y),
+                (x - 1, y),
+                (x, y + 1),
+                (x, y - 1),
+                (x, y)
+            )
+
+            for nx, ny in moves:
+
+                if nx < 0 or ny < 0:
+                    continue
+
+                if nx >= grid.width or ny >= grid.height:
+                    continue
+
+                if self._blocked(obstacles, nx, ny):
+                    continue
+
+                if self._peer_conflict(
+                    (nx, ny),
+                    (x, y),
+                    nt,
+                    peer_paths
+                ):
+                    continue
+
+                nxt = (nx, ny, nt)
+                nc = cost[cur] + 1
+
+                if nxt not in cost or nc < cost[nxt]:
+                    cost[nxt] = nc
+
+                    h = abs(nx - goal[0]) + abs(ny - goal[1])
+
+                    heappush(
+                        q,
+                        (nc + h, nxt)
+                    )
+
+                    came_from[nxt] = cur
+
+        return []
+
+    def _astar(self, start, goal, obstacles, grid):
+        q = []
+        heappush(q, (0, start))
+
+        came_from = {}
+        cost = {start: 0}
+
+        while q:
+            _, cur = heappop(q)
+
+            if cur == goal:
+                return self._build_path(came_from, cur)
+
+            x, y = cur
+
+            for nx, ny in (
+                (x + 1, y),
+                (x - 1, y),
+                (x, y + 1),
+                (x, y - 1)
+            ):
+                if nx < 0 or ny < 0:
+                    continue
+
+                if nx >= grid.width or ny >= grid.height:
+                    continue
+
+                if self._blocked(obstacles, nx, ny):
+                    continue
+
+                nc = cost[cur] + 1
+
+                if (nx, ny) not in cost or nc < cost[(nx, ny)]:
+                    cost[(nx, ny)] = nc
+
+                    h = abs(nx - goal[0]) + abs(ny - goal[1])
+
+                    heappush(
+                        q,
+                        (nc + h, (nx, ny))
+                    )
+
+                    came_from[(nx, ny)] = cur
+
+        return []
+
+    def _peer_conflict(
+        self,
+        position,
+        previous,
+        timestamp,
+        peer_paths
+    ):
+        for path in peer_paths.values():
+
+            if not path:
+                continue
+
+            if timestamp < len(path):
+                peer_position = path[timestamp]
+
+                if position == peer_position:
+                    return True
+
+            if timestamp > 0 and timestamp - 1 < len(path):
+                peer_position = path[timestamp - 1]
+
+                if position == peer_position and previous == peer_position:
+                    return True
+
+        return False
+
+    def _blocked(self, obstacles, x, y):
+        return any(
+            o.x == x and o.y == y
+            for o in obstacles
+        )
+
+    def _build_path(self, came_from, cur):
+        path = [cur]
+
+        while cur in came_from:
+            cur = came_from[cur]
+            path.append(cur)
+
+        path.reverse()
+        return path
+
+    def _build_time_path(self, came_from, cur):
+        path = []
+
+        while True:
+            path.append((cur[0], cur[1]))
+
+            if cur not in came_from:
+                break
+
+            cur = came_from[cur]
+
+        path.reverse()
+        return path
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\robot.py ================
+
+from dataclasses import dataclass
+from math import sqrt
+
+
+@dataclass
+class RobotSpec:
+    id: str
+    shape: str
+    length: float
+    width: float
+    height: float
+    mass: float
+    wheel_track: float
+    wheel_radius: float
+    max_speed: float
+    acceleration: float
+    braking: float
+    safety_margin: float
+
+    def validate(self):
+        if not self.id:
+            raise ValueError("Robot ID is required")
+
+        if self.shape not in ("rectangle", "circle"):
+            raise ValueError("Invalid robot shape")
+
+        if self.length <= 0 or self.width <= 0 or self.height <= 0:
+            raise ValueError("Robot dimensions must be positive")
+
+        if self.mass <= 0:
+            raise ValueError("Mass must be positive")
+
+        if self.wheel_track <= 0 or self.wheel_radius <= 0:
+            raise ValueError("Wheel dimensions must be positive")
+
+        if self.max_speed <= 0:
+            raise ValueError("Max speed must be positive")
+
+        if self.acceleration <= 0 or self.braking <= 0:
+            raise ValueError("Acceleration and braking must be positive")
+
+        if self.safety_margin < 0:
+            raise ValueError("Safety margin cannot be negative")
+
+    @property
+    def radius(self):
+        if self.shape == "circle":
+            return self.width / 2
+
+        return sqrt((self.length / 2) ** 2 + (self.width / 2) ** 2)
+
+    @property
+    def braking_distance(self):
+        return self.max_speed ** 2 / (2 * self.braking)
+    
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\safety.py ================
+
+from enum import Enum
+from .robot import RobotSpec
+from .geometry import Footprint
+from .config import SafetyConfig
+
+
+class SafetyLevel(Enum):
+    NORMAL = "normal"
+    CAUTION = "caution"
+    HARD_STOP = "hard_stop"
+
+
+def hard_stop_distance(robot: RobotSpec, config: SafetyConfig):
+    footprint = Footprint.from_robot(robot)
+
+    return (
+        footprint.radius
+        + robot.braking_distance
+        + robot.max_speed * config.reaction_latency
+        + config.margin
+    )
+
+
+def get_safety_level(distance, robot: RobotSpec, config: SafetyConfig):
+    d = hard_stop_distance(robot, config)
+
+    if distance <= d:
+        return SafetyLevel.HARD_STOP
+
+    if distance <= d * 2:
+        return SafetyLevel.CAUTION
+
+    return SafetyLevel.NORMAL
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\scenario.py ================
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Scenario:
+    id: str
+    name: str
+    description: str
+    obstacles: list = field(default_factory=list)
+    robots: list = field(default_factory=list)
+    tasks: list = field(default_factory=list)
+
+
+class ScenarioRunner:
+    def __init__(self, simulator, engine):
+        self.sim = simulator
+        self.engine = engine
+
+    def load(self, scenario):
+        if isinstance(scenario, Scenario):
+            data = {
+                "obstacles": scenario.obstacles,
+                "robots": scenario.robots,
+                "tasks": scenario.tasks
+            }
+        else:
+            data = scenario
+
+        self.sim.obstacles.clear()
+        self.sim.obstacles.extend(data["obstacles"])
+
+        self.sim.robots.clear()
+        self.sim.tasks.clear()
+
+        for robot in data["robots"]:
+            self.sim.add_robot(
+                robot["id"],
+                robot["x"],
+                robot["y"],
+                robot.get("theta", 0.0),
+                robot.get("battery", 100.0)
+            )
+
+        for task in data["tasks"]:
+            self.sim.add_task(task)
+
+    def kill_robot(self, robot_id):
+        self.sim.kill_robot(robot_id)
+
+    def block_cell(self, obstacle):
+        if obstacle not in self.sim.obstacles:
+            self.sim.obstacles.append(obstacle)
+
+    def unblock_cell(self, obstacle):
+        if obstacle in self.sim.obstacles:
+            self.sim.obstacles.remove(obstacle)
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\scenarios.py ================
+
+from .obstacle import Obstacle
+from .task import Task
+
+
+class ScenarioLibrary:
+
+    def head_on(self):
+        return {
+            "id": "head_on",
+            "name": "Head-on",
+            "description": "Two robots approach each other in a shared aisle.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 1.5,
+                    "y": 2.5
+                },
+                {
+                    "id": "R2",
+                    "x": 8.5,
+                    "y": 2.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (1, 2),
+                    (8, 2),
+                    "R1"
+                ),
+                Task(
+                    "T002",
+                    (8, 2),
+                    (1, 2),
+                    "R2"
+                )
+            ],
+            "obstacles": []
+        }
+
+    def t_junction(self):
+        return {
+            "id": "t_junction",
+            "name": "T-Junction",
+            "description": "Two robots approach a shared junction.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 2.5,
+                    "y": 5.5
+                },
+                {
+                    "id": "R2",
+                    "x": 5.5,
+                    "y": 2.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (2, 5),
+                    (5, 5),
+                    "R1"
+                ),
+                Task(
+                    "T002",
+                    (5, 2),
+                    (5, 6),
+                    "R2"
+                )
+            ],
+            "obstacles": [
+                Obstacle(3, 4),
+                Obstacle(4, 4)
+            ]
+        }
+
+    def narrow_aisle(self):
+        return {
+            "id": "narrow_aisle",
+            "name": "Narrow Aisle",
+            "description": "Robots share a constrained aisle.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 1.5,
+                    "y": 4.5
+                },
+                {
+                    "id": "R2",
+                    "x": 8.5,
+                    "y": 4.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (1, 4),
+                    (8, 4),
+                    "R1"
+                ),
+                Task(
+                    "T002",
+                    (8, 4),
+                    (1, 4),
+                    "R2"
+                )
+            ],
+            "obstacles": []
+        }
+
+    def three_way_choke(self):
+        return {
+            "id": "three_way_choke",
+            "name": "3-Way Choke",
+            "description": "Three robots converge on one area.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 1.5,
+                    "y": 5.5
+                },
+                {
+                    "id": "R2",
+                    "x": 5.5,
+                    "y": 1.5
+                },
+                {
+                    "id": "R3",
+                    "x": 9.5,
+                    "y": 5.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (1, 5),
+                    (5, 5),
+                    "R1"
+                ),
+                Task(
+                    "T002",
+                    (5, 1),
+                    (5, 5),
+                    "R2"
+                ),
+                Task(
+                    "T003",
+                    (9, 5),
+                    (5, 5),
+                    "R3"
+                )
+            ],
+            "obstacles": []
+        }
+
+    def four_way_choke(self):
+        return {
+            "id": "four_way_choke",
+            "name": "4-Way Choke",
+            "description": "Four robots approach a shared intersection.",
+            "robots": [
+                {"id": "R1", "x": 1.5, "y": 5.5},
+                {"id": "R2", "x": 5.5, "y": 1.5},
+                {"id": "R3", "x": 9.5, "y": 5.5},
+                {"id": "R4", "x": 5.5, "y": 9.5}
+            ],
+            "tasks": [
+                Task("T001", (1, 5), (9, 5), "R1"),
+                Task("T002", (5, 1), (5, 9), "R2"),
+                Task("T003", (9, 5), (1, 5), "R3"),
+                Task("T004", (5, 9), (5, 1), "R4")
+            ],
+            "obstacles": []
+        }
+
+    def blocked_aisle(self):
+        return {
+            "id": "blocked_aisle",
+            "name": "Blocked Aisle",
+            "description": "A route becomes temporarily blocked.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 1.5,
+                    "y": 2.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (1, 2),
+                    (8, 2),
+                    "R1"
+                )
+            ],
+            "obstacles": [
+                Obstacle(
+                    4,
+                    2,
+                    True
+                )
+            ]
+        }
+
+    def robot_failure(self):
+        return {
+            "id": "robot_failure",
+            "name": "Robot Failure",
+            "description": "One robot fails during fleet operation.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 2.5,
+                    "y": 2.5
+                },
+                {
+                    "id": "R2",
+                    "x": 7.5,
+                    "y": 2.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (2, 2),
+                    (8, 2),
+                    "R1"
+                ),
+                Task(
+                    "T002",
+                    (7, 2),
+                    (2, 2),
+                    "R2"
+                )
+            ],
+            "obstacles": []
+        }
+
+    def wifi_dead_zone(self):
+        return {
+            "id": "wifi_dead_zone",
+            "name": "Wi-Fi Dead Zone",
+            "description": "A spatial region temporarily loses communication.",
+            "robots": [
+                {
+                    "id": "R1",
+                    "x": 1.5,
+                    "y": 5.5
+                },
+                {
+                    "id": "R2",
+                    "x": 8.5,
+                    "y": 5.5
+                }
+            ],
+            "tasks": [
+                Task(
+                    "T001",
+                    (1, 5),
+                    (8, 5),
+                    "R1"
+                ),
+                Task(
+                    "T002",
+                    (8, 5),
+                    (1, 5),
+                    "R2"
+                )
+            ],
+            "obstacles": []
+        }
+
+    def all(self):
+        return {
+            "head_on": self.head_on,
+            "t_junction": self.t_junction,
+            "narrow_aisle": self.narrow_aisle,
+            "three_way_choke": self.three_way_choke,
+            "four_way_choke": self.four_way_choke,
+            "blocked_aisle": self.blocked_aisle,
+            "robot_failure": self.robot_failure,
+            "wifi_dead_zone": self.wifi_dead_zone
+        }
+
+    def get(self, scenario_id):
+        scenarios = self.all()
+
+        if scenario_id not in scenarios:
+            raise ValueError(
+                f"Unknown scenario: {scenario_id}"
+            )
+
+        return scenarios[scenario_id]()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\simulator.py ================
+
+from dataclasses import dataclass
+from math import sqrt
+from .state import RobotState
+
+
+@dataclass
+class SimConfig:
+    dt: float = 0.1
+
+
+class WarehouseSimulator:
+    def __init__(
+        self,
+        grid,
+        obstacles,
+        robot_specs,
+        config=None
+    ):
+        self.grid = grid
+        self.obstacles = obstacles
+        self.robot_specs = robot_specs
+        self.config = config or SimConfig()
+        self.robots = {}
+        self.tasks = {}
+        self.time = 0.0
+
+    def add_robot(
+        self,
+        robot_id,
+        x,
+        y,
+        theta=0.0,
+        battery=100.0
+    ):
+        self.robots[robot_id] = RobotState(
+            robot_id,
+            x,
+            y,
+            theta,
+            0.0,
+            0.0,
+            battery
+        )
+
+    def add_task(self, task):
+        self.tasks[task.id] = task
+
+    def get_robot(self, robot_id):
+        return self.robots.get(robot_id)
+
+    def step(self, commands):
+        dt = self.config.dt
+
+        for robot_id, command in commands.items():
+            robot = self.robots.get(robot_id)
+
+            if not robot or not robot.active:
+                continue
+
+            robot.vx = command.vx
+            robot.vy = command.vy
+
+            if command.stop:
+                robot.vx = 0.0
+                robot.vy = 0.0
+
+            robot.x += robot.vx * dt
+            robot.y += robot.vy * dt
+
+            if robot.vx != 0 or robot.vy != 0:
+                robot.theta = self._heading(
+                    robot.vx,
+                    robot.vy
+                )
+
+            robot.battery = max(
+                0.0,
+                robot.battery - 0.01
+            )
+
+        self.time += dt
+
+    def stop_robot(self, robot_id):
+        robot = self.robots.get(robot_id)
+
+        if robot:
+            robot.vx = 0.0
+            robot.vy = 0.0
+
+    def kill_robot(self, robot_id):
+        robot = self.robots.get(robot_id)
+
+        if robot:
+            robot.active = False
+            robot.vx = 0.0
+            robot.vy = 0.0
+
+    def complete_task(self, task_id):
+        task = self.tasks.get(task_id)
+
+        if task:
+            task.complete()
+
+    def _heading(self, vx, vy):
+        from math import atan2
+        return atan2(vy, vx)
+
+    def distance(self, a, b):
+        dx = a.x - b.x
+        dy = a.y - b.y
+        return sqrt(dx * dx + dy * dy)
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\spatial.py ================
+
+from .cell import Cell, cell_from_position
+
+
+class SpatialManager:
+
+    def __init__(self, cell_size):
+        self.cell_size = cell_size
+        self.current_cells = {}
+
+    def get_cell(self, x, y):
+        return cell_from_position(
+            x,
+            y,
+            self.cell_size
+        )
+
+    def set_robot_position(self, robot_id, x, y):
+        old = self.current_cells.get(robot_id)
+        new = self.get_cell(x, y)
+
+        self.current_cells[robot_id] = new
+
+        if old is None:
+            return {
+                "event": "CELL_ENTER",
+                "robot_id": robot_id,
+                "cell": new
+            }
+
+        if old == new:
+            return None
+
+        return {
+            "event": "CELL_CHANGE",
+            "robot_id": robot_id,
+            "old_cell": old,
+            "new_cell": new
+        }
+
+    def remove_robot(self, robot_id):
+        self.current_cells.pop(robot_id, None)
+
+    def get_cell_for_robot(self, robot_id):
+        return self.current_cells.get(robot_id)
+
+    def get_subscriptions(self, robot_id):
+        cell = self.current_cells.get(robot_id)
+
+        if not cell:
+            return []
+
+        return cell.neighbors()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\state.py ================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class RobotState:
+    id: str
+    x: float
+    y: float
+    theta: float
+    vx: float
+    vy: float
+    battery: float
+    task_id: str | None = None
+    active: bool = True
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\strategy.py ================
+
+from abc import ABC, abstractmethod
+
+
+class CoordinationStrategy(ABC):
+
+    @abstractmethod
+    def plan(self, state, peers):
+        pass
+
+    @abstractmethod
+    def decide_motion(self, state, peers):
+        pass
+
+
+class StopAndWait(CoordinationStrategy):
+
+    def plan(self, state, peers):
+        return []
+
+    def decide_motion(self, state, peers):
+        if peers:
+            return {
+                "vx": 0.0,
+                "vy": 0.0,
+                "stop": True
+            }
+
+        return {
+            "vx": state.get("vx", 0.0),
+            "vy": state.get("vy", 0.0),
+            "stop": False
+        }
+
+
+class PriorityOnly(CoordinationStrategy):
+
+    def plan(self, state, peers):
+        return state.get("path", [])
+
+    def decide_motion(self, state, peers):
+        if not peers:
+            return {
+                "vx": state.get("vx", 0.0),
+                "vy": state.get("vy", 0.0),
+                "stop": False
+            }
+
+        my_id = state.get("id", "")
+
+        for peer in peers:
+            if peer.get("id", "") < my_id:
+                return {
+                    "vx": 0.0,
+                    "vy": 0.0,
+                    "stop": True
+                }
+
+        return {
+            "vx": state.get("vx", 0.0),
+            "vy": state.get("vy", 0.0),
+            "stop": False
+        }
+
+
+class ArcnetFull(CoordinationStrategy):
+
+    def plan(self, state, peers):
+        return state.get("path", [])
+
+    def decide_motion(self, state, peers):
+        return {
+            "vx": state.get("vx", 0.0),
+            "vy": state.get("vy", 0.0),
+            "stop": state.get("stop", False)
+        }
+
+
+STRATEGIES = {
+    "stop_and_wait": StopAndWait,
+    "priority_only": PriorityOnly,
+    "arcnet": ArcnetFull
+}
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\task.py ================
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class Task:
+    id: str
+    start: tuple[int, int]
+    destination: tuple[int, int]
+    assigned_robot: str | None = None
+    completed: bool = False
+    status: TaskStatus = TaskStatus.PENDING
+
+    def activate(self):
+        if self.status == TaskStatus.PENDING:
+            self.status = TaskStatus.ACTIVE
+
+    def complete(self):
+        self.completed = True
+        self.status = TaskStatus.COMPLETED
+
+    def fail(self):
+        self.status = TaskStatus.FAILED
+        self.completed = False
+
+    def release(self):
+        self.assigned_robot = None
+        self.status = TaskStatus.PENDING
+        self.completed = False
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\time.py ================
+
+from abc import ABC, abstractmethod
+import time
+
+
+class Clock(ABC):
+    @abstractmethod
+    def now(self):
+        pass
+
+
+class WallClock(Clock):
+    def now(self):
+        return time.time()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\transport.py ================
+
+from abc import ABC, abstractmethod
+
+
+class Transport(ABC):
+    @abstractmethod
+    def send(self, message):
+        pass
+
+    @abstractmethod
+    def receive(self):
+        pass
+
+
+class InMemoryTransport(Transport):
+    def __init__(self):
+        self.messages = []
+
+    def send(self, message):
+        self.messages.append(message)
+
+    def receive(self):
+        messages = self.messages[:]
+        self.messages.clear()
+        return messages
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\validation.py ================
+
+from dataclasses import dataclass
+import csv
+
+
+@dataclass
+class ValidationResult:
+    scenario: str
+    strategy: str
+    completion_time: float
+    collisions: int
+    near_misses: int
+    stops: int
+    replans: int
+    deadlocks: int
+    deadlocks_resolved: int
+    tasks_completed: int
+    tasks_failed: int
+
+
+class ValidationRunner:
+
+    def __init__(self, factory):
+        self.factory = factory
+
+    def run(self, scenario_id, strategy):
+        simulator, engine, runner = self.factory(
+            scenario_id,
+            strategy
+        )
+
+        metrics = runner.run()
+
+        return ValidationResult(
+            scenario=scenario_id,
+            strategy=strategy,
+            completion_time=metrics.completion_time,
+            collisions=metrics.collisions,
+            near_misses=metrics.near_misses,
+            stops=metrics.stops,
+            replans=metrics.replans,
+            deadlocks=metrics.deadlocks_detected,
+            deadlocks_resolved=metrics.deadlocks_resolved,
+            tasks_completed=metrics.tasks_completed,
+            tasks_failed=metrics.tasks_failed
+        )
+
+    def compare(self, scenario_id):
+        return [
+            self.run(
+                scenario_id,
+                "stop_and_wait"
+            ),
+            self.run(
+                scenario_id,
+                "arcnet"
+            )
+        ]
+
+    def run_many(self, scenario_ids):
+        results = []
+
+        for scenario_id in scenario_ids:
+            results.extend(
+                self.compare(scenario_id)
+            )
+
+        return results
+
+
+def write_results(results, path):
+    if not results:
+        return
+
+    fields = [
+        "scenario",
+        "strategy",
+        "completion_time",
+        "collisions",
+        "near_misses",
+        "stops",
+        "replans",
+        "deadlocks",
+        "deadlocks_resolved",
+        "tasks_completed",
+        "tasks_failed"
+    ]
+
+    with open(
+        path,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields
+        )
+
+        writer.writeheader()
+
+        for result in results:
+            writer.writerow({
+                field: getattr(
+                    result,
+                    field
+                )
+                for field in fields
+            })
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\arcnet_core\__init__.py ================
+
+from .robot import RobotSpec
+from .state import RobotState
+from .geometry import Footprint, surface_gap
+from .safety import SafetyLevel
+from .config import SafetyConfig, LivenessConfig, NetworkConfig, ArcnetConfig
+from .message import RobotMessage
+from .clock import LamportClock
+from .peer import Peer, PeerStatus, PeerManager
+from .cell import Cell
+from .grid import Grid
+from .obstacle import Obstacle
+from .planner import PathPlanner
+from .arbiter import ConflictArbiter
+from .intent import RobotIntent
+from .deadlock import WaitForGraph
+from .motion import MotionCommand, MotionController
+from .task import Task, TaskStatus
+from .allocator import TaskAllocator, ManualAllocator, CentralAllocator, ContractNetAllocator
+from .strategy import CoordinationStrategy
+from .transport import Transport
+from .time import Clock
+from .metrics import Metrics
+from .conflict import Conflict, ConflictDetector
+from .decision import CoordinationDecision
+from .engine import ArcnetEngine
+from .spatial import SpatialManager
+from .avoidance import LocalAvoidance, AvoidanceResult
+from .simulator import WarehouseSimulator, SimConfig
+from .baseline import StopAndWaitBaseline
+from .fleet import FleetRunner
+from .scenario import Scenario, ScenarioRunner
+from .faults import Fault, FaultManager
+from .scenarios import ScenarioLibrary
+from .validation import ValidationResult, ValidationRunner, write_results
+from .events import Event, EventLog
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\brain_node.py ================
+
+#!/usr/bin/env python3
+"""
+brain_node.py -- FINAL v3
+
+v3 fix: asymmetric stop-or-go. Previously the caution-zone check
+stopped BOTH robots whenever they got close, regardless of the
+priority tiebreak -- so the "winner" from path planning still froze
+in the control loop, producing mutual standoffs instead of one robot
+passing. Now only the priority LOSER stops in the caution zone; the
+winner keeps moving. A separate, smaller, priority-blind hard-safety
+distance still applies to everyone as a true last-resort failsafe.
+
+Usage: python3 brain_node.py <robot_name> <goal_x> <goal_y> [smart|baseline]
+"""
+
+import sys, time, math
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+
+import warehouse_grid as grid
+import motion_controller as motion
+from path_planner import plan_path, PeerIntent
+from intent_codec import encode_intent, decode_intent, is_stale
+from metrics import log_run
+from lamport_clock import LamportClock
+from conflict_resolver import PriorityInfo, wins, find_cycle_from, pick_deadlock_victim
+
+REPLAN_INTERVAL = 3.0
+BROADCAST_INTERVAL = 0.5
+CONTROL_INTERVAL = 0.1
+DEADLOCK_CHECK_INTERVAL = 1.0
+PEER_STALE_AGE = 2.0
+LIVE_STALE_AGE = 1.5
+YIELD_DURATION = 4.0
+
+class FleetBrainNode(Node):
+    def __init__(self, robot_name, goal_x, goal_y, mode="smart"):
+        super().__init__(f'brain_{robot_name}')
+        self.robot_name = robot_name
+        self.goal_x = goal_x
+        self.goal_y = goal_y
+        self.mode = mode
+
+        self.x = self.y = self.yaw = 0.0
+        self.battery = 100.0
+        self._odom_received = False
+        self.start_x = self.start_y = None
+
+        self.peers = {}
+        self.current_plan_cells = []
+        self.current_plan_times = []
+        self.task_start_time = time.time()
+        self.goal_reached = False
+
+        self.clock = LamportClock()
+        self.waiting_for = None
+        self.wait_started_at = None
+        self._yield_until = 0.0
+        self._active_cycle_key = None
+
+        self.collision_count = 0
+        self.near_miss_count = 0
+        self.emergency_stop_count = 0
+        self.replan_count = 0
+        self.deadlocks_detected = 0
+        self.deadlocks_broken = 0
+        self._collision_active = self._near_miss_active = self._estop_active = False
+
+        self.cmd_pub = self.create_publisher(Twist, f'/{robot_name}/cmd_vel', 10)
+        self.intent_pub = self.create_publisher(String, '/fleet/intent', 10)
+        self.create_subscription(Odometry, f'/{robot_name}/odom', self._odom_cb, 10)
+        self.create_subscription(String, '/fleet/intent', self._intent_cb, 10)
+
+        self.create_timer(REPLAN_INTERVAL, self._replan)
+        self.create_timer(BROADCAST_INTERVAL, self._broadcast_intent)
+        self.create_timer(CONTROL_INTERVAL, self._control_step)
+        if self.mode == "smart":
+            self.create_timer(DEADLOCK_CHECK_INTERVAL, self._check_deadlock)
+
+        self.get_logger().info(f'{robot_name} brain started [{mode}], goal=({goal_x},{goal_y})')
+
+    def _odom_cb(self, msg):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        if not self._odom_received:
+            self.start_x, self.start_y = self.x, self.y
+            self._odom_received = True
+        q = msg.pose.pose.orientation
+        self.yaw = motion.yaw_from_quaternion(q.x, q.y, q.z, q.w)
+
+    def _intent_cb(self, msg):
+        try:
+            data = decode_intent(msg.data)
+        except Exception:
+            return
+        if data['robot_id'] == self.robot_name:
+            return
+        self.clock.update(data.get('lamport_time', 0))
+        data['received_at'] = time.time()
+        self.peers[data['robot_id']] = data
+
+    def _active_peer_intents(self):
+        now = time.time()
+        result = {}
+        for rid, data in self.peers.items():
+            if is_stale(data['sent_at'], now, PEER_STALE_AGE):
+                continue
+            cells = [tuple(c) for c in data['planned_cells']]
+            result[rid] = PeerIntent(robot_id=rid, planned_cells=cells,
+                                      planned_times=data['planned_times'],
+                                      current_x=data['x'], current_y=data['y'])
+        return result
+
+    def _live_peer_positions(self):
+        now = time.time()
+        return {rid: (d['x'], d['y']) for rid, d in self.peers.items()
+                if not is_stale(d['sent_at'], now, LIVE_STALE_AGE)}
+
+    def _peer_priorities(self, now):
+        result = {}
+        for rid, data in self.peers.items():
+            if is_stale(data['sent_at'], now, PEER_STALE_AGE):
+                continue
+            result[rid] = PriorityInfo(robot_id=rid,
+                                        lamport_time=data.get('lamport_time', 0),
+                                        wait_started_at=data.get('wait_started_at'))
+        return result
+
+    def _my_priority_info(self):
+        return PriorityInfo(robot_id=self.robot_name, lamport_time=self.clock.time,
+                             wait_started_at=self.wait_started_at)
+
+    def _am_i_yielding_to(self, peer_id, now):
+        """True = I lose the tiebreak against peer_id and should stop. Unknown peer -> be safe, yield."""
+        peer_data = self.peers.get(peer_id)
+        if peer_data is None:
+            return True
+        peer_info = PriorityInfo(robot_id=peer_id,
+                                  lamport_time=peer_data.get('lamport_time', 0),
+                                  wait_started_at=peer_data.get('wait_started_at'))
+        return not wins(self._my_priority_info(), peer_info, now)
+
+    def _replan(self):
+        if self.goal_reached or time.time() < self._yield_until:
+            return
+        start_cell = grid.world_to_grid(self.x, self.y)
+        goal_cell = grid.world_to_grid(self.goal_x, self.goal_y)
+        if start_cell == goal_cell:
+            self.current_plan_cells = []
+            return
+
+        now = time.time()
+        if self.mode == "baseline":
+            peer_intents, priorities, my_info = {}, None, None
+        else:
+            peer_intents = self._active_peer_intents()
+            priorities = self._peer_priorities(now)
+            my_info = self._my_priority_info()
+
+        result = plan_path(start_cell, goal_cell, start_time=now, robot_id=self.robot_name,
+                            peer_intents=peer_intents, priorities=priorities,
+                            my_priority_info=my_info, now=now)
+
+        if result is None:
+            self.get_logger().warn(f'{self.robot_name}: no path found')
+            return
+
+        self.current_plan_cells = result.path_cells
+        self.current_plan_times = result.arrival_times
+        self.replan_count += 1
+        self.get_logger().info(
+            f'{self.robot_name} [{self.mode}]: replanned, {len(result.path_cells)} cells, '
+            f'cost={result.total_cost:.1f}, peers_known={len(peer_intents)}')
+
+    def _broadcast_intent(self):
+        self.clock.increment()
+        msg = String()
+        msg.data = encode_intent(
+            robot_id=self.robot_name, x=self.x, y=self.y,
+            goal_x=self.goal_x, goal_y=self.goal_y,
+            planned_cells=[list(c) for c in self.current_plan_cells],
+            planned_times=self.current_plan_times, battery=self.battery,
+            lamport_time=self.clock.time, waiting_for=self.waiting_for,
+            wait_started_at=self.wait_started_at)
+        self.intent_pub.publish(msg)
+
+    def _check_deadlock(self):
+        now = time.time()
+        graph = {self.robot_name: self.waiting_for}
+        for rid, data in self.peers.items():
+            if not is_stale(data['sent_at'], now, PEER_STALE_AGE):
+                graph[rid] = data.get('waiting_for')
+
+        cycle = find_cycle_from(self.robot_name, graph)
+        cycle_key = tuple(sorted(cycle)) if cycle else None
+        if cycle is None:
+            self._active_cycle_key = None
+            return
+        if cycle_key == self._active_cycle_key:
+            return
+
+        self._active_cycle_key = cycle_key
+        self.deadlocks_detected += 1
+        priorities = self._peer_priorities(now)
+        priorities[self.robot_name] = self._my_priority_info()
+        victim = pick_deadlock_victim(cycle, priorities, now)
+
+        self.get_logger().warn(f'{self.robot_name}: DEADLOCK cycle {cycle}, victim={victim}')
+        if victim == self.robot_name:
+            self.deadlocks_broken += 1
+            self._yield_until = now + YIELD_DURATION
+            self.get_logger().warn(f'{self.robot_name}: yielding {YIELD_DURATION}s to break deadlock')
+
+    def _on_goal_reached(self):
+        self.goal_reached = True
+        task_time = time.time() - self.task_start_time
+        self.current_plan_cells = []
+        self.get_logger().info(
+            f'*** {self.robot_name} REACHED GOAL in {task_time:.1f}s [mode={self.mode} '
+            f'collisions={self.collision_count} near_misses={self.near_miss_count} '
+            f'emergency_stops={self.emergency_stop_count} replans={self.replan_count} '
+            f'deadlocks_detected={self.deadlocks_detected} deadlocks_broken={self.deadlocks_broken}] ***')
+        log_run(self.mode, self.robot_name, self.start_x, self.start_y, self.goal_x, self.goal_y,
+                task_time, self.collision_count, self.near_miss_count, self.emergency_stop_count,
+                self.replan_count, self.deadlocks_detected, self.deadlocks_broken)
+
+    def _update_collision_metrics(self, min_dist):
+        """Pure metrics -- counts actual proximity events. No stop decisions here."""
+        if min_dist is not None and min_dist < motion.COLLISION_DISTANCE:
+            if not self._collision_active:
+                self.collision_count += 1
+                self._collision_active = True
+                self.get_logger().error(f'{self.robot_name}: COLLISION (dist={min_dist:.2f}m)')
+        else:
+            self._collision_active = False
+
+        if min_dist is not None and min_dist < motion.NEAR_MISS_DISTANCE:
+            if not self._near_miss_active:
+                self.near_miss_count += 1
+                self._near_miss_active = True
+        else:
+            self._near_miss_active = False
+
+    def _set_waiting(self, peer_id, now):
+        if not self._estop_active:
+            self.emergency_stop_count += 1
+            self._estop_active = True
+        if self.waiting_for != peer_id:
+            self.waiting_for = peer_id
+            self.wait_started_at = now
+
+    def _clear_waiting(self):
+        self._estop_active = False
+        self.waiting_for = None
+        self.wait_started_at = None
+
+    def _control_step(self):
+        if not self._odom_received:
+            return
+        dist_to_goal = motion.distance_to(self.x, self.y, self.goal_x, self.goal_y)
+        if not self.goal_reached and dist_to_goal < motion.GOAL_TOLERANCE:
+            self._on_goal_reached()
+        if self.goal_reached:
+            self.cmd_pub.publish(Twist())
+            return
+
+        now = time.time()
+        peer_positions = self._live_peer_positions()
+        min_dist, min_id = motion.closest_peer_distance(self.x, self.y, peer_positions)
+        self._update_collision_metrics(min_dist)
+
+        # Universal, priority-blind failsafe -- applies to EVERYONE, no exceptions.
+        if motion.hard_safety_stop_needed(min_dist):
+            self.cmd_pub.publish(Twist())
+            self._set_waiting(min_id, now)
+            return
+
+        if now < self._yield_until:
+            self.cmd_pub.publish(Twist())
+            return
+
+        if self.mode == "baseline":
+            if motion.stop_and_wait_needed(min_dist):
+                self.cmd_pub.publish(Twist())
+                self._set_waiting(min_id, now)
+                return
+            self._clear_waiting()
+        else:
+            if motion.emergency_stop_needed(min_dist):
+                if self._am_i_yielding_to(min_id, now):
+                    self.cmd_pub.publish(Twist())
+                    self._set_waiting(min_id, now)
+                    return
+                else:
+                    self._clear_waiting()  # I have priority -- keep going
+            else:
+                self._clear_waiting()
+
+        if not self.current_plan_cells:
+            self.cmd_pub.publish(Twist())
+            return
+
+        while len(self.current_plan_cells) > 1:
+            wx, wy = grid.grid_to_world(self.current_plan_cells[0])
+            if math.hypot(wx - self.x, wy - self.y) < 0.3:
+                self.current_plan_cells.pop(0)
+                self.current_plan_times.pop(0)
+            else:
+                break
+
+        tx, ty = grid.grid_to_world(self.current_plan_cells[0])
+        cmd = motion.compute_velocity_command(self.x, self.y, self.yaw, tx, ty)
+        twist = Twist()
+        twist.linear.x = cmd.linear_x
+        twist.angular.z = cmd.angular_z
+        self.cmd_pub.publish(twist)
+
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: python3 brain_node.py <robot_name> <goal_x> <goal_y> [smart|baseline]")
+        sys.exit(1)
+    robot_name, goal_x, goal_y = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+    mode = sys.argv[4] if len(sys.argv) > 4 else "smart"
+    rclpy.init()
+    node = FleetBrainNode(robot_name, goal_x, goal_y, mode)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\conflict_resolver.py ================
+
+"""
+conflict_resolver.py
+
+Pure logic, no ROS. Three responsibilities:
+
+1. priority_key() -- deterministic tiebreak: Lamport timestamp (earlier
+   claim wins) + robot_id, with AGING so a robot that keeps losing
+   ties eventually wins anyway (prevents starvation / convoy effect).
+   Every robot computes this identically from shared broadcast state --
+   this replaces an explicit request/reply handshake (Ricart-Agrawala
+   normally needs one; we don't, because full state is already shared).
+
+2. Wait-for graph + cycle detection -- classic OS/DB deadlock
+   detection, run independently by each robot on its own local view.
+
+3. Victim selection -- lowest-priority robot in a detected cycle backs
+   off. This is detection+recovery, not prevention: we don't try to
+   rule out every possible conflict upfront, we catch a real deadlock
+   the moment it forms and break it with certainty.
+"""
+
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
+
+AGING_STEP_SECONDS = 3.0
+MAX_AGING_STEPS = 20
+
+@dataclass
+class PriorityInfo:
+    robot_id: str
+    lamport_time: int
+    wait_started_at: Optional[float]
+
+def priority_key(info: PriorityInfo, now: float) -> Tuple[int, int, str]:
+    """Smaller key wins. (-aging_steps, lamport_time, robot_id)."""
+    if info.wait_started_at is None:
+        aging_steps = 0
+    else:
+        waited = max(0.0, now - info.wait_started_at)
+        aging_steps = min(MAX_AGING_STEPS, int(waited // AGING_STEP_SECONDS))
+    return (-aging_steps, info.lamport_time, info.robot_id)
+
+def wins(my_info: PriorityInfo, peer_info: PriorityInfo, now: float) -> bool:
+    """True if I have priority over peer (I do NOT yield)."""
+    return priority_key(my_info, now) < priority_key(peer_info, now)
+
+def find_cycle_from(start: str, graph: Dict[str, Optional[str]], max_depth: int = 10) -> Optional[List[str]]:
+    """Follow start's wait-for chain; if it loops back to start, that's a deadlock cycle."""
+    path = [start]
+    current = start
+    for _ in range(max_depth):
+        nxt = graph.get(current)
+        if nxt is None:
+            return None
+        if nxt == start:
+            return path
+        if nxt in path:
+            return None
+        path.append(nxt)
+        current = nxt
+    return None
+
+def pick_deadlock_victim(cycle: List[str], priorities: Dict[str, PriorityInfo], now: float) -> str:
+    """Lowest-priority (largest key) robot in the cycle backs off."""
+    return max(cycle, key=lambda rid: priority_key(priorities[rid], now))
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\get_shelf_bbox.py ================
+
+"""
+get_shelf_bbox.py
+
+Loads each shelf's actual collision mesh (.DAE) and computes its real
+axis-aligned bounding box in meters. Raw DAE vertex data is in
+centimeters (per <unit meter="0.010000">), so we scale by 0.01 to get
+true meters -- confirmed via grep on the file's own <asset><unit> tag.
+"""
+
+import numpy as np
+from collada import Collada
+
+UNIT_SCALE = 0.01  # centimeters -> meters, per this file set's <unit> tag
+
+MODELS = {
+    "ShelfD_01": "/home/eesha/amr_ws/src/bcr_bot/models/aws_robomaker_warehouse_ShelfD_01/meshes/aws_robomaker_warehouse_ShelfD_01_collision.DAE",
+    "ShelfE_01": "/home/eesha/amr_ws/src/bcr_bot/models/aws_robomaker_warehouse_ShelfE_01/meshes/aws_robomaker_warehouse_ShelfE_01_collision.DAE",
+    "ShelfF_01": "/home/eesha/amr_ws/src/bcr_bot/models/aws_robomaker_warehouse_ShelfF_01/meshes/aws_robomaker_warehouse_ShelfF_01_collision.DAE",
+}
+
+for name, path in MODELS.items():
+    mesh = Collada(path)
+    all_verts = []
+    for geom in mesh.geometries:
+        for prim in geom.primitives:
+            all_verts.append(prim.vertex)
+    verts = np.vstack(all_verts) * UNIT_SCALE
+    mins = verts.min(axis=0)
+    maxs = verts.max(axis=0)
+    size = maxs - mins
+    print(f"{name}:")
+    print(f"  min: x={mins[0]:.3f} y={mins[1]:.3f} z={mins[2]:.3f}")
+    print(f"  max: x={maxs[0]:.3f} y={maxs[1]:.3f} z={maxs[2]:.3f}")
+    print(f"  SIZE (width x depth x height): {size[0]:.3f} x {size[1]:.3f} x {size[2]:.3f} meters")
+    print()
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\intent_codec.py ================
+
+"""
+intent_codec.py
+JSON-over-std_msgs/String for /fleet/intent. v2: adds lamport_time,
+waiting_for, wait_started_at for priority tiebreaking + deadlock detection.
+"""
+
+import json
+import time
+
+def encode_intent(robot_id, x, y, goal_x, goal_y, planned_cells, planned_times,
+                   battery=100.0, lamport_time=0, waiting_for=None, wait_started_at=None):
+    payload = {
+        "robot_id": robot_id, "x": x, "y": y,
+        "goal_x": goal_x, "goal_y": goal_y,
+        "planned_cells": planned_cells, "planned_times": planned_times,
+        "battery": battery,
+        "lamport_time": lamport_time,
+        "waiting_for": waiting_for,
+        "wait_started_at": wait_started_at,
+        "sent_at": time.time(),
+    }
+    return json.dumps(payload)
+
+def decode_intent(data_str):
+    return json.loads(data_str)
+
+def is_stale(sent_at, now, max_age):
+    return (now - sent_at) > max_age
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\lamport_clock.py ================
+
+"""
+lamport_clock.py
+Minimal Lamport logical clock (Lamport, 1978). Gives every robot a
+deterministic, total ordering of events across the fleet without
+needing synchronized real-world clocks.
+"""
+
+class LamportClock:
+    def __init__(self):
+        self.time = 0
+
+    def increment(self):
+        self.time += 1
+        return self.time
+
+    def update(self, received_time):
+        self.time = max(self.time, received_time) + 1
+        return self.time
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\metrics.py ================
+
+"""metrics.py -- CSV logger, one row per robot per completed run."""
+
+import csv, os, time
+
+METRICS_FILE = os.path.expanduser("~/amr_ws/fleet_dev/metrics_log.csv")
+FIELDS = ["timestamp", "run_mode", "robot_id", "start_x", "start_y",
+          "goal_x", "goal_y", "task_time_sec", "collisions", "near_misses",
+          "emergency_stops", "replans", "deadlocks_detected", "deadlocks_broken"]
+
+def log_run(run_mode, robot_id, start_x, start_y, goal_x, goal_y, task_time_sec,
+            collisions, near_misses, emergency_stops, replans,
+            deadlocks_detected=0, deadlocks_broken=0):
+    file_exists = os.path.isfile(METRICS_FILE)
+    with open(METRICS_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "run_mode": run_mode,
+            "robot_id": robot_id, "start_x": f"{start_x:.2f}", "start_y": f"{start_y:.2f}",
+            "goal_x": goal_x, "goal_y": goal_y, "task_time_sec": f"{task_time_sec:.2f}",
+            "collisions": collisions, "near_misses": near_misses,
+            "emergency_stops": emergency_stops, "replans": replans,
+            "deadlocks_detected": deadlocks_detected, "deadlocks_broken": deadlocks_broken,
+        })
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\motion_controller.py ================
+
+"""
+motion_controller.py
+
+Pure logic, no ROS dependency. v2: three distinct stop thresholds,
+not one -- this is the fix for the mutual-freeze bug:
+
+  - HARD_SAFETY_STOP_DISTANCE: universal, priority-blind, true last
+    resort. Nobody's exempt, ever. Pure physical safety net.
+  - EMERGENCY_STOP_DISTANCE: the "caution zone". Entering it no longer
+    means an automatic stop -- brain_node.py now checks the priority
+    tiebreak first. Only the LOSING robot stops here; the winner keeps
+    moving, since its own plan already routes around the peer via the
+    planner's hard-block. Previously BOTH robots stopped here
+    regardless of priority, which is exactly what produced the mutual
+    standoff / long freeze seen with robot3.
+  - STOP_AND_WAIT_DISTANCE: baseline mode only. Deliberately dumb, no
+    priority, no yielding -- this IS the comparison point.
+"""
+
+import math
+from dataclasses import dataclass
+
+LINEAR_SPEED = 0.4
+ANGULAR_GAIN = 1.5
+GOAL_TOLERANCE = 0.25
+HEADING_SLOWDOWN_ANGLE = 0.6
+
+COLLISION_DISTANCE = 0.45
+NEAR_MISS_DISTANCE = 1.0
+HARD_SAFETY_STOP_DISTANCE = 0.5
+EMERGENCY_STOP_DISTANCE = 0.7
+STOP_AND_WAIT_DISTANCE = 1.2
+
+@dataclass
+class VelocityCommand:
+    linear_x: float
+    angular_z: float
+
+def yaw_from_quaternion(x, y, z, w):
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+def _normalize_angle(angle):
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+def distance_to(cx, cy, tx, ty):
+    return math.hypot(tx - cx, ty - cy)
+
+def compute_velocity_command(current_x, current_y, current_yaw, target_x, target_y) -> VelocityCommand:
+    dist = distance_to(current_x, current_y, target_x, target_y)
+    if dist < GOAL_TOLERANCE:
+        return VelocityCommand(linear_x=0.0, angular_z=0.0)
+    target_heading = math.atan2(target_y - current_y, target_x - current_x)
+    heading_error = _normalize_angle(target_heading - current_yaw)
+    angular = ANGULAR_GAIN * heading_error
+    linear = 0.0 if abs(heading_error) > HEADING_SLOWDOWN_ANGLE else LINEAR_SPEED
+    return VelocityCommand(linear_x=linear, angular_z=angular)
+
+def closest_peer_distance(my_x, my_y, peer_positions):
+    best, best_id = None, None
+    for rid, (px, py) in peer_positions.items():
+        d = distance_to(my_x, my_y, px, py)
+        if best is None or d < best:
+            best, best_id = d, rid
+    return best, best_id
+
+def hard_safety_stop_needed(min_dist):
+    return min_dist is not None and min_dist < HARD_SAFETY_STOP_DISTANCE
+
+def emergency_stop_needed(min_dist):
+    return min_dist is not None and min_dist < EMERGENCY_STOP_DISTANCE
+
+def stop_and_wait_needed(min_dist):
+    return min_dist is not None and min_dist < STOP_AND_WAIT_DISTANCE
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\path_planner.py ================
+
+"""
+path_planner.py
+
+Three layers now:
+  1. SOFT (predictive): peer's future intended cell near the same time
+     = expensive, not forbidden.
+  2. HARD-LIVE: peer's CURRENT physical position = un-passable, always.
+  3. HARD-CONTESTED (new): if a peer's claimed future cell+time overlaps
+     mine AND that peer currently wins the priority tiebreak (Lamport+
+     aging, see conflict_resolver.py), their claim is hard-blocked for
+     me too -- I yield. If I win instead, it stays soft-cost only,
+     because the peer's own planner will independently reach the same
+     conclusion and yield to me. No message exchange needed -- both
+     sides compute the same deterministic answer from shared broadcasts.
+"""
+
+import heapq
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import warehouse_grid as grid
+from conflict_resolver import PriorityInfo, wins
+
+MOVE_TIME = 1.0
+CONGESTION_WINDOW = 2.0
+CONGESTION_PENALTY = 15.0
+DYNAMIC_BLOCK_RADIUS = 1
+DYNAMIC_BLOCK_HORIZON = 2.5
+
+@dataclass
+class PeerIntent:
+    robot_id: str
+    planned_cells: List[Tuple[int, int]]
+    planned_times: List[float]
+    current_x: float = 0.0
+    current_y: float = 0.0
+
+@dataclass
+class PlanResult:
+    path_cells: List[Tuple[int, int]]
+    arrival_times: List[float]
+    total_cost: float
+
+def _dynamic_blocked_cells(peer_intents, ignore_robot_id):
+    blocked = set()
+    for robot_id, intent in peer_intents.items():
+        if robot_id == ignore_robot_id:
+            continue
+        cx, cy = grid.world_to_grid(intent.current_x, intent.current_y)
+        for dc in range(-DYNAMIC_BLOCK_RADIUS, DYNAMIC_BLOCK_RADIUS + 1):
+            for dr in range(-DYNAMIC_BLOCK_RADIUS, DYNAMIC_BLOCK_RADIUS + 1):
+                blocked.add((cx + dc, cy + dr))
+    return blocked
+
+def _resolve_step(next_cell, next_time, peer_intents, priorities, my_priority_info, now, robot_id):
+    """Returns (hard_blocked: bool, soft_cost: float)."""
+    soft_cost = 0.0
+    for pid, intent in peer_intents.items():
+        if pid == robot_id:
+            continue
+        for pcell, ptime in zip(intent.planned_cells, intent.planned_times):
+            if pcell == next_cell and abs(ptime - next_time) <= CONGESTION_WINDOW:
+                overlap = CONGESTION_WINDOW - abs(ptime - next_time)
+                peer_info = priorities.get(pid) if priorities else None
+                if peer_info is not None and my_priority_info is not None:
+                    if not wins(my_priority_info, peer_info, now):
+                        return True, 0.0
+                soft_cost += CONGESTION_PENALTY * overlap
+    return False, soft_cost
+
+def _heuristic(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def plan_path(start_cell, goal_cell, start_time, robot_id,
+              peer_intents: Optional[Dict[str, PeerIntent]] = None,
+              priorities: Optional[Dict[str, PriorityInfo]] = None,
+              my_priority_info: Optional[PriorityInfo] = None,
+              now: float = 0.0) -> Optional[PlanResult]:
+    peer_intents = peer_intents or {}
+    dynamic_blocked = _dynamic_blocked_cells(peer_intents, robot_id)
+
+    open_heap = []
+    counter = 0
+    heapq.heappush(open_heap, (0.0, counter, start_cell, start_time))
+    came_from = {}
+    g_score = {(start_cell, start_time): 0.0}
+    visited = set()
+
+    while open_heap:
+        _, _, current_cell, current_time = heapq.heappop(open_heap)
+        if (current_cell, current_time) in visited:
+            continue
+        visited.add((current_cell, current_time))
+
+        if current_cell == goal_cell:
+            return _reconstruct(came_from, (current_cell, current_time), g_score)
+
+        for next_cell in grid.neighbors(current_cell):
+            next_time = current_time + MOVE_TIME
+
+            if next_cell in dynamic_blocked and (next_time - start_time) < DYNAMIC_BLOCK_HORIZON:
+                continue
+
+            hard_blocked, soft_cost = _resolve_step(
+                next_cell, next_time, peer_intents, priorities, my_priority_info, now, robot_id)
+            if hard_blocked:
+                continue
+
+            step_cost = MOVE_TIME + soft_cost
+            tentative_g = g_score[(current_cell, current_time)] + step_cost
+            key = (next_cell, next_time)
+
+            if key not in g_score or tentative_g < g_score[key]:
+                g_score[key] = tentative_g
+                came_from[key] = (current_cell, current_time)
+                f_score = tentative_g + _heuristic(next_cell, goal_cell)
+                counter += 1
+                heapq.heappush(open_heap, (f_score, counter, next_cell, next_time))
+
+    return None
+
+def _reconstruct(came_from, end_key, g_score) -> PlanResult:
+    path_cells, arrival_times = [], []
+    key = end_key
+    while key in came_from:
+        cell, t = key
+        path_cells.append(cell)
+        arrival_times.append(t)
+        key = came_from[key]
+    cell, t = key
+    path_cells.append(cell)
+    arrival_times.append(t)
+    path_cells.reverse()
+    arrival_times.reverse()
+    return PlanResult(path_cells=path_cells, arrival_times=arrival_times, total_cost=g_score[end_key])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\test_planner.py ================
+
+"""
+Standalone proof: same start/goal, same grid, only difference is whether
+peer intent is supplied. If the innovation is real, the path or arrival
+time should change when a predicted conflict exists -- not just avoid
+literal currently-occupied cells (that's baseline A*, not predictive).
+"""
+
+import warehouse_grid as grid
+from path_planner import plan_path, PeerIntent
+
+
+def show(label, result):
+    if result is None:
+        print(f"{label}: NO PATH FOUND")
+        return
+    print(f"{label}: {len(result.path_cells)} cells, total_cost={result.total_cost:.1f}, "
+          f"arrives goal at t={result.arrival_times[-1]:.1f}s")
+
+
+start_b = (8, 5)
+goal_b = (8, 34)
+
+print("Grid size:", grid.GRID_WIDTH, "x", grid.GRID_HEIGHT)
+print("Obstacle cell count:", len(grid.OBSTACLES))
+print()
+
+baseline = plan_path(start_b, goal_b, start_time=0.0, robot_id="robot2", peer_intents={})
+show("No peer knowledge (baseline A*)", baseline)
+
+conflict_cell = baseline.path_cells[len(baseline.path_cells) // 2] if baseline else (8, 20)
+conflict_time = baseline.arrival_times[len(baseline.arrival_times) // 2] if baseline else 15.0
+
+peer_a_intent = PeerIntent(
+    robot_id="robot1",
+    planned_cells=[conflict_cell],
+    planned_times=[conflict_time],
+)
+
+print(f"\nRobot1 has broadcast intent: will be at {conflict_cell} at t={conflict_time:.1f}s")
+print("(this cell sits on Robot2's baseline shortest path)\n")
+
+predictive = plan_path(start_b, goal_b, start_time=0.0, robot_id="robot2",
+                        peer_intents={"robot1": peer_a_intent})
+show("With peer intent known (predictive-cost A*)", predictive)
+
+if baseline and predictive:
+    same_path = baseline.path_cells == predictive.path_cells
+    same_timing = baseline.arrival_times == predictive.arrival_times
+    print(f"\nIdentical path AND timing to baseline: {same_path and same_timing}")
+    if not (same_path and same_timing):
+        print(">>> Planner rerouted or re-timed to avoid predicted future congestion. <<<")
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\fleet_dev\warehouse_grid.py ================
+
+"""
+warehouse_grid.py
+
+Grid built from REAL shelf geometry: poses from small_warehouse.sdf
+(all yaw=0, confirmed via grep) combined with actual collision mesh
+bounding boxes (extracted from the .DAE files via pycollada, unit-scaled
+0.01 per each file's <asset><unit> tag). No padding-guesses.
+
+Two shelf walls run nearly the full warehouse length:
+  - ShelfD/E row at x~4.7 (6 units, confirmed contiguous -- one wall)
+  - ShelfF at x~-5.8 (single model, but itself an 18m-long shelf run)
+Open central aisle sits between them, roughly -4.79 < x < 4.28.
+"""
+
+CELL_SIZE = 0.5
+GRID_WIDTH = 100
+GRID_HEIGHT = 100
+ORIGIN_X = -20.0
+ORIGIN_Y = -20.0
+
+# Rectangular obstacle regions in GRID cells: (col_min, row_min, col_max, row_max)
+# Derived from real mesh bounding boxes + real world poses (see module docstring)
+SHELF_REGIONS = [
+    (47, 20, 51, 44),   # ShelfD/E row, world x:[4.28,5.16] y:[-9.95,1.91]
+    (25, 20, 31, 57),   # ShelfF, world x:[-6.89,-4.79] y:[-9.95,8.10]
+]
+
+def _build_obstacle_set():
+    obstacles = set()
+    for (c0, r0, c1, r1) in SHELF_REGIONS:
+        for c in range(c0, c1 + 1):
+            for r in range(r0, r1 + 1):
+                obstacles.add((c, r))
+    return obstacles
+
+OBSTACLES = _build_obstacle_set()
+
+def world_to_grid(x, y):
+    col = int((x - ORIGIN_X) / CELL_SIZE)
+    row = int((y - ORIGIN_Y) / CELL_SIZE)
+    return (col, row)
+
+def grid_to_world(cell):
+    col, row = cell
+    x = ORIGIN_X + (col + 0.5) * CELL_SIZE
+    y = ORIGIN_Y + (row + 0.5) * CELL_SIZE
+    return (x, y)
+
+def in_bounds(cell):
+    col, row = cell
+    return 0 <= col < GRID_WIDTH and 0 <= row < GRID_HEIGHT
+
+def is_walkable(cell):
+    return in_bounds(cell) and cell not in OBSTACLES
+
+def neighbors(cell):
+    col, row = cell
+    candidates = [(col + 1, row), (col - 1, row), (col, row + 1), (col, row - 1)]
+    return [c for c in candidates if is_walkable(c)]
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\bcr_bot_gazebo_spawn.launch.py ================
+
+#!/usr/bin/env python3
+
+from os.path import join
+import xacro
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, Command
+from launch.substitutions import PythonExpression
+
+from launch_ros.actions import Node
+
+def get_xacro_to_doc(xacro_file_path, mappings):
+    doc = xacro.parse(open(xacro_file_path))
+    xacro.process_doc(doc, mappings=mappings)
+    return doc
+
+def generate_launch_description():
+    # Get bcr_bot package's share directory path
+    bcr_bot_path = get_package_share_directory('bcr_bot')
+    
+    # Retrieve launch configuration arguments
+    position_x = LaunchConfiguration("position_x")
+    position_y = LaunchConfiguration("position_y")
+    orientation_yaw = LaunchConfiguration("orientation_yaw")
+    camera_enabled = LaunchConfiguration("camera_enabled", default=True)
+    stereo_camera_enabled = LaunchConfiguration("stereo_camera_enabled", default=False)
+    two_d_lidar_enabled = LaunchConfiguration("two_d_lidar_enabled", default=True)
+    odometry_source = LaunchConfiguration("odometry_source", default="world")
+    robot_namespace = LaunchConfiguration("robot_namespace", default='bcr_bot')
+    
+    # Path to the Xacro file
+    xacro_path = join(bcr_bot_path, 'urdf', 'bcr_bot.xacro')
+    #doc = get_xacro_to_doc(xacro_path, {"wheel_odom_topic": "odom", "sim_gazebo": "true", "two_d_lidar_enabled": "true", "camera_enabled": "true"})
+
+    # Launch the robot_state_publisher node
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[
+                    {'robot_description': Command( \
+                    ['xacro ', xacro_path,
+                    ' camera_enabled:=', camera_enabled,
+                    ' stereo_camera_enabled:=', stereo_camera_enabled,
+                    ' two_d_lidar_enabled:=', two_d_lidar_enabled,
+                    ' sim_gazebo:=', "true",
+                    ' odometry_source:=', odometry_source,
+                    ' robot_namespace:=', robot_namespace,
+                    ])}],
+        remappings=[
+            ('/joint_states', PythonExpression(['"', robot_namespace, '/joint_states"'])),
+        ]
+    )
+
+    # Launch the spawn_entity node to spawn the robot in Gazebo
+    spawn_entity = Node(
+        package='gazebo_ros',
+        executable='spawn_entity.py',
+        output='screen',
+        arguments=[
+            '-topic', "/robot_description",
+            '-entity', PythonExpression(['"', robot_namespace, '_robot"']), #default enitity name _bcr_bot
+            '-z', "0.28",
+            '-x', position_x,
+            '-y', position_y,
+            '-Y', orientation_yaw
+        ]
+    )
+
+
+
+    return LaunchDescription([
+        # Declare launch arguments
+        DeclareLaunchArgument("camera_enabled", default_value = camera_enabled),
+        DeclareLaunchArgument("stereo_camera_enabled", default_value = stereo_camera_enabled),
+        DeclareLaunchArgument("two_d_lidar_enabled", default_value = two_d_lidar_enabled),
+        DeclareLaunchArgument("position_x", default_value="0.0"),
+        DeclareLaunchArgument("position_y", default_value="0.0"),
+        DeclareLaunchArgument("orientation_yaw", default_value="0.0"),
+        DeclareLaunchArgument("odometry_source", default_value = odometry_source),
+        DeclareLaunchArgument("robot_namespace", default_value = robot_namespace),
+        # DeclareLaunchArgument('robot_description', default_value=doc.toxml()),
+        robot_state_publisher,
+        spawn_entity
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\bcr_bot_gz_spawn.launch.py ================
+
+#!/usr/bin/python3
+
+from os.path import join
+from xacro import parse, process_doc
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, Command
+
+from launch_ros.actions import Node
+
+from ament_index_python.packages import get_package_share_directory
+
+def get_xacro_to_doc(xacro_file_path, mappings):
+    doc = parse(open(xacro_file_path))
+    process_doc(doc, mappings=mappings)
+    return doc
+
+def generate_launch_description():
+   
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+    position_x = LaunchConfiguration("position_x")
+    position_y = LaunchConfiguration("position_y")
+    orientation_yaw = LaunchConfiguration("orientation_yaw")
+    camera_enabled = LaunchConfiguration("camera_enabled", default=True)
+    stereo_camera_enabled = LaunchConfiguration("stereo_camera_enabled", default=False)
+    two_d_lidar_enabled = LaunchConfiguration("two_d_lidar_enabled", default=True)
+    odometry_source = LaunchConfiguration("odometry_source")
+
+    # robot_description_content = get_xacro_to_doc(
+    #     join(bcr_bot_path, "urdf", "bcr_bot.xacro"),
+    #     {"sim_gz": "true",
+    #      "two_d_lidar_enabled": "true",
+    #      "conveyor_enabled": "false",
+    #      "camera_enabled": "true"
+    #     }
+    # ).toxml()
+
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        parameters=[
+                    {'robot_description': Command( \
+                    ['xacro ', join(bcr_bot_path, 'urdf/bcr_bot.xacro'),
+                    ' camera_enabled:=', camera_enabled,
+                    ' stereo_camera_enabled:=', stereo_camera_enabled,
+                    ' two_d_lidar_enabled:=', two_d_lidar_enabled,
+                    ' odometry_source:=', odometry_source,
+                    ' sim_gz:=', "true"
+                    ])}],
+        remappings=[
+            ('/joint_states', 'bcr_bot/joint_states'),
+        ]
+    )
+
+    gz_spawn_entity = Node(
+        package="ros_gz_sim",
+        executable="create",
+        arguments=[
+            "-topic", "/robot_description",
+            "-name", "bcr_bot",
+            "-allow_renaming", "true",
+            "-z", "0.28",
+            "-x", position_x,
+            "-y", position_y,
+            "-Y", orientation_yaw
+        ]
+    )
+
+    gz_ros2_bridge = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        arguments=[
+            "/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist",
+            "/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock",
+            "/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry",
+            "/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V",
+            "/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan",
+            "/kinect_camera@sensor_msgs/msg/Image[gz.msgs.Image",
+            "/stereo_camera/left/image_raw@sensor_msgs/msg/Image[gz.msgs.Image",
+            "stereo_camera/right/image_raw@sensor_msgs/msg/Image[gz.msgs.Image",
+            "kinect_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            "stereo_camera/left/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            "stereo_camera/right/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            "/kinect_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked",
+            "/imu@sensor_msgs/msg/Imu[gz.msgs.IMU",
+            "/world/default/model/bcr_bot/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model"
+        ],
+        remappings=[
+            ('/world/default/model/bcr_bot/joint_state', 'bcr_bot/joint_states'),
+            ('/odom', 'bcr_bot/odom'),
+            ('/scan', 'bcr_bot/scan'),
+            ('/kinect_camera', 'bcr_bot/kinect_camera'),
+            ('/stereo_camera/left/image_raw', 'bcr_bot/stereo_camera/left/image_raw'),
+            ('/stereo_camera/right/image_raw', 'bcr_bot/stereo_camera/right/image_raw'),
+            ('/imu', 'bcr_bot/imu'),
+            ('/cmd_vel', 'bcr_bot/cmd_vel'),
+            ('kinect_camera/camera_info', 'bcr_bot/kinect_camera/camera_info'),
+            ('stereo_camera/left/camera_info', 'bcr_bot/stereo_camera/left/camera_info'),
+            ('stereo_camera/right/camera_info', 'bcr_bot/stereo_camera/right/camera_info'),
+            ('/kinect_camera/points', 'bcr_bot/kinect_camera/points'),
+        ]
+    )
+
+    transform_publisher = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        arguments = ["--x", "0.0",
+                    "--y", "0.0",
+                    "--z", "0.0",
+                    "--yaw", "0.0",
+                    "--pitch", "0.0",
+                    "--roll", "0.0",
+                    "--frame-id", "kinect_camera",
+                    "--child-frame-id", "bcr_bot/base_footprint/kinect_camera"]
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument("camera_enabled", default_value = camera_enabled),
+        DeclareLaunchArgument("stereo_camera_enabled", default_value = stereo_camera_enabled),
+        DeclareLaunchArgument("two_d_lidar_enabled", default_value = two_d_lidar_enabled),
+        DeclareLaunchArgument("position_x", default_value="0.0"),
+        DeclareLaunchArgument("position_y", default_value="0.0"),
+        DeclareLaunchArgument("orientation_yaw", default_value="0.0"),
+        DeclareLaunchArgument("odometry_source", default_value="world"),
+        robot_state_publisher,
+        gz_spawn_entity, transform_publisher, gz_ros2_bridge
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\bcr_bot_ign_spawn.launch.py ================
+
+#!/usr/bin/python3
+
+from os.path import join
+from xacro import parse, process_doc
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, Command
+
+from launch_ros.actions import Node
+
+from ament_index_python.packages import get_package_share_directory
+
+def get_xacro_to_doc(xacro_file_path, mappings):
+    doc = parse(open(xacro_file_path))
+    process_doc(doc, mappings=mappings)
+    return doc
+
+def generate_launch_description():
+   
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+    position_x = LaunchConfiguration("position_x")
+    position_y = LaunchConfiguration("position_y")
+    orientation_yaw = LaunchConfiguration("orientation_yaw")
+    camera_enabled = LaunchConfiguration("camera_enabled", default=True)
+    stereo_camera_enabled = LaunchConfiguration("stereo_camera_enabled", default=False)
+    two_d_lidar_enabled = LaunchConfiguration("two_d_lidar_enabled", default=True)
+    odometry_source = LaunchConfiguration("odometry_source")
+
+    # robot_description_content = get_xacro_to_doc(
+    #     join(bcr_bot_path, "urdf", "bcr_bot.xacro"),
+    #     {"sim_gz": "true",
+    #      "two_d_lidar_enabled": "true",
+    #      "conveyor_enabled": "false",
+    #      "camera_enabled": "true"
+    #     }
+    # ).toxml()
+
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        parameters=[
+                    {'robot_description': Command( \
+                    ['xacro ', join(bcr_bot_path, 'urdf/bcr_bot.xacro'),
+                    ' camera_enabled:=', camera_enabled,
+                    ' stereo_camera_enabled:=', stereo_camera_enabled,
+                    ' two_d_lidar_enabled:=', two_d_lidar_enabled,
+                    ' odometry_source:=', odometry_source,
+                    ' sim_ign:=', "true"
+                    ])}],
+        remappings=[
+            ('/joint_states', 'bcr_bot/joint_states'),
+        ]
+    )
+
+    gz_spawn_entity = Node(
+        package="ros_gz_sim",
+        executable="create",
+        arguments=[
+            "-topic", "/robot_description",
+            "-name", "bcr_bot",
+            "-allow_renaming", "true",
+            "-z", "0.28",
+            "-x", position_x,
+            "-y", position_y,
+            "-Y", orientation_yaw
+        ]
+    )
+
+    gz_ros2_bridge = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        arguments=[
+            "/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist",
+            "/clock@rosgraph_msgs/msg/Clock[ignition.msgs.Clock",
+            "/odom@nav_msgs/msg/Odometry[ignition.msgs.Odometry",
+            "/tf@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V",
+            "/scan@sensor_msgs/msg/LaserScan[ignition.msgs.LaserScan",
+            "/kinect_camera@sensor_msgs/msg/Image[ignition.msgs.Image",
+            "/stereo_camera/left/image_raw@sensor_msgs/msg/Image[ignition.msgs.Image",
+            "stereo_camera/right/image_raw@sensor_msgs/msg/Image[ignition.msgs.Image",
+            "kinect_camera/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo",
+            "stereo_camera/left/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo",
+            "stereo_camera/right/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo",
+            "/kinect_camera/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked",
+            "/imu@sensor_msgs/msg/Imu[ignition.msgs.IMU",
+            "/world/default/model/bcr_bot/joint_state@sensor_msgs/msg/JointState[ignition.msgs.Model"
+        ],
+        remappings=[
+            ('/world/default/model/bcr_bot/joint_state', 'bcr_bot/joint_states'),
+            ('/odom', 'bcr_bot/odom'),
+            ('/scan', 'bcr_bot/scan'),
+            ('/kinect_camera', 'bcr_bot/kinect_camera'),
+            ('/stereo_camera/left/image_raw', 'bcr_bot/stereo_camera/left/image_raw'),
+            ('/stereo_camera/right/image_raw', 'bcr_bot/stereo_camera/right/image_raw'),
+            ('/imu', 'bcr_bot/imu'),
+            ('/cmd_vel', 'bcr_bot/cmd_vel'),
+            ('kinect_camera/camera_info', 'bcr_bot/kinect_camera/camera_info'),
+            ('stereo_camera/left/camera_info', 'bcr_bot/stereo_camera/left/camera_info'),
+            ('stereo_camera/right/camera_info', 'bcr_bot/stereo_camera/right/camera_info'),
+            ('/kinect_camera/points', 'bcr_bot/kinect_camera/points'),
+        ]
+    )
+
+    transform_publisher = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        arguments = ["--x", "0.0",
+                    "--y", "0.0",
+                    "--z", "0.0",
+                    "--yaw", "0.0",
+                    "--pitch", "0.0",
+                    "--roll", "0.0",
+                    "--frame-id", "kinect_camera",
+                    "--child-frame-id", "bcr_bot/base_footprint/kinect_camera"]
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument("camera_enabled", default_value = camera_enabled),
+        DeclareLaunchArgument("stereo_camera_enabled", default_value = stereo_camera_enabled),
+        DeclareLaunchArgument("two_d_lidar_enabled", default_value = two_d_lidar_enabled),
+        DeclareLaunchArgument("position_x", default_value="0.0"),
+        DeclareLaunchArgument("position_y", default_value="0.0"),
+        DeclareLaunchArgument("orientation_yaw", default_value="0.0"),
+        DeclareLaunchArgument("odometry_source", default_value="world"),
+        robot_state_publisher,
+        gz_spawn_entity, transform_publisher, gz_ros2_bridge
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\bcr_bot_multi_spawn.launch.py ================
+
+#!/usr/bin/python3
+
+from os.path import join
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration, Command
+
+from launch_ros.actions import Node
+
+from ament_index_python.packages import get_package_share_directory
+
+
+def launch_setup(context, *args, **kwargs):
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+
+    robot_name = LaunchConfiguration("robot_name").perform(context)
+    position_x = LaunchConfiguration("position_x").perform(context)
+    position_y = LaunchConfiguration("position_y").perform(context)
+    orientation_yaw = LaunchConfiguration("orientation_yaw").perform(context)
+    camera_enabled = LaunchConfiguration("camera_enabled").perform(context)
+    stereo_camera_enabled = LaunchConfiguration("stereo_camera_enabled").perform(context)
+    two_d_lidar_enabled = LaunchConfiguration("two_d_lidar_enabled").perform(context)
+    odometry_source = LaunchConfiguration("odometry_source").perform(context)
+
+    wheel_odom_topic = f"{robot_name}/odom"
+    robot_description_topic = f"/{robot_name}/robot_description"
+
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name=f"robot_state_publisher_{robot_name}",
+        parameters=[{
+            'robot_description': Command([
+                'xacro ', join(bcr_bot_path, 'urdf/bcr_bot.xacro'),
+                ' camera_enabled:=', camera_enabled,
+                ' stereo_camera_enabled:=', stereo_camera_enabled,
+                ' two_d_lidar_enabled:=', two_d_lidar_enabled,
+                ' odometry_source:=', odometry_source,
+                ' robot_name:=', robot_name,
+                ' wheel_odom_topic:=', wheel_odom_topic,
+                ' sim_gz:=', "true"
+            ])
+        }],
+        remappings=[
+            ('/joint_states', f'/{robot_name}/joint_states'),
+            ('/robot_description', robot_description_topic),
+        ]
+    )
+
+    gz_spawn_entity = Node(
+        package="ros_gz_sim",
+        executable="create",
+        arguments=[
+            "-topic", robot_description_topic,
+            "-name", robot_name,
+            "-allow_renaming", "true",
+            "-z", "0.28",
+            "-x", position_x,
+            "-y", position_y,
+            "-Y", orientation_yaw
+        ]
+    )
+
+    gz_ros2_bridge = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        name=f"ros_gz_bridge_{robot_name}",
+        arguments=[
+            f"{robot_name}/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist",
+            "/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock",
+            f"{wheel_odom_topic}@nav_msgs/msg/Odometry[gz.msgs.Odometry",
+            "/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V",
+            f"{robot_name}/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan",
+            f"{robot_name}/kinect_camera@sensor_msgs/msg/Image[gz.msgs.Image",
+            f"{robot_name}/stereo_camera/left/image_raw@sensor_msgs/msg/Image[gz.msgs.Image",
+            f"{robot_name}/stereo_camera/right/image_raw@sensor_msgs/msg/Image[gz.msgs.Image",
+        ]
+    )
+
+    gz_ros2_bridge_extra = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        name=f"ros_gz_bridge_extra_{robot_name}",
+        arguments=[
+            f"{robot_name}/kinect_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            f"{robot_name}/stereo_camera/left/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            f"{robot_name}/stereo_camera/right/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
+            f"{robot_name}/kinect_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked",
+            f"{robot_name}/imu@sensor_msgs/msg/Imu[gz.msgs.IMU",
+            f"/world/default/model/{robot_name}/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model"
+        ],
+        remappings=[
+            (f'/world/default/model/{robot_name}/joint_state', f'/{robot_name}/joint_states'),
+        ]
+    )
+
+    transform_publisher = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name=f"kinect_tf_{robot_name}",
+        arguments=["--x", "0.0",
+                   "--y", "0.0",
+                   "--z", "0.0",
+                   "--yaw", "0.0",
+                   "--pitch", "0.0",
+                   "--roll", "0.0",
+                   "--frame-id", f"{robot_name}/kinect_camera",
+                   "--child-frame-id", f"{robot_name}/base_footprint/kinect_camera"]
+    )
+
+    return [robot_state_publisher, gz_spawn_entity, transform_publisher, gz_ros2_bridge, gz_ros2_bridge_extra]
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument("robot_name", default_value="bcr_bot"),
+        DeclareLaunchArgument("position_x", default_value="0.0"),
+        DeclareLaunchArgument("position_y", default_value="0.0"),
+        DeclareLaunchArgument("orientation_yaw", default_value="0.0"),
+        DeclareLaunchArgument("camera_enabled", default_value="true"),
+        DeclareLaunchArgument("stereo_camera_enabled", default_value="false"),
+        DeclareLaunchArgument("two_d_lidar_enabled", default_value="true"),
+        DeclareLaunchArgument("odometry_source", default_value="world"),
+        OpaqueFunction(function=launch_setup)
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\fleet_bringup.launch.py ================
+
+#!/usr/bin/python3
+
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from ament_index_python.packages import get_package_share_directory
+from os.path import join
+
+
+def generate_launch_description():
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+    multi_spawn_launch = join(bcr_bot_path, "launch", "bcr_bot_multi_spawn.launch.py")
+
+    # Confirmed-safe zone only: x in [-4.6, 4.1], y in [-9.9, 1.9] --
+    # entirely inside the double-shelf-walled open floor (ShelfD/E east
+    # wall, ShelfF west wall), well clear of the ClutteringA/C/D +
+    # Bucket + TrashCan cluster which sits at y > ~2.3. No guessing.
+    #
+    # robot1 and robot2 share the same x=0 line, driving head-on --
+    # genuine conflict, not just shared open floor. robot3 crosses
+    # perpendicular through the same midpoint (y=-4).
+    robots = [
+        {"name": "robot1", "x": "0.0",  "y": "-9.0", "yaw": "1.5708",  "delay": 0.0},
+        {"name": "robot2", "x": "0.0",  "y": "1.0",  "yaw": "-1.5708", "delay": 10.0},
+        {"name": "robot3", "x": "-3.0", "y": "-4.0", "yaw": "0.0",     "delay": 20.0},
+    ]
+
+    actions = []
+    for r in robots:
+        include = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(multi_spawn_launch),
+            launch_arguments={
+                "robot_name": r["name"],
+                "position_x": r["x"],
+                "position_y": r["y"],
+                "orientation_yaw": r["yaw"],
+                "camera_enabled": "false",
+                "stereo_camera_enabled": "false",
+                "two_d_lidar_enabled": "false",
+            }.items()
+        )
+        actions.append(TimerAction(period=r["delay"], actions=[include]))
+
+    return LaunchDescription(actions)
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\gazebo.launch.py ================
+
+#!/usr/bin/env python3
+
+from os.path import join
+
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.substitutions import LaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import SetEnvironmentVariable
+from launch.actions import AppendEnvironmentVariable
+
+def generate_launch_description():
+    # Get bcr_bot package's share directory path
+    bcr_bot_path = get_package_share_directory('bcr_bot')
+
+    # Retrieve launch configuration arguments
+    use_sim_time = LaunchConfiguration('use_sim_time', default='true')
+    
+    
+    world_file = LaunchConfiguration("world_file", default = join(bcr_bot_path, 'worlds', 'small_warehouse.sdf'))
+    
+    # Include the Gazebo launch file
+    gazebo_share = get_package_share_directory("gazebo_ros")
+    gazebo = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(gazebo_share, "launch", "gazebo.launch.py"))
+    )
+
+    # spawing bcr_bot
+    spawn_bcr_bot_node = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(bcr_bot_path, "launch", "bcr_bot_gazebo_spawn.launch.py")),
+    )
+
+    return LaunchDescription([
+        # Declare launch arguments
+        
+        AppendEnvironmentVariable(
+        name='GAZEBO_MODEL_PATH',
+        value=join(bcr_bot_path, "models")),
+
+        SetEnvironmentVariable(
+        name='GAZEBO_RESOURCE_PATH',
+        value="/usr/share/gazebo-11:" + join(bcr_bot_path, "worlds")),
+        DeclareLaunchArgument('world', default_value = world_file),
+        DeclareLaunchArgument('gui', default_value='true'),
+        DeclareLaunchArgument('verbose', default_value='false'),
+        DeclareLaunchArgument('use_sim_time', default_value = use_sim_time),
+        gazebo,spawn_bcr_bot_node
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\gz.launch.py ================
+
+#!/usr/bin/python3
+
+from os.path import join
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.substitutions import LaunchConfiguration,PythonExpression
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from ament_index_python.packages import get_package_share_directory
+from launch.actions import AppendEnvironmentVariable
+
+
+def generate_launch_description():
+    use_sim_time = LaunchConfiguration("use_sim_time", default=True)
+
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+    world_file = LaunchConfiguration("world_file", default = join(bcr_bot_path, "worlds", "small_warehouse.sdf"))
+    gz_sim_share = get_package_share_directory("ros_gz_sim")
+
+    gz_sim = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(gz_sim_share, "launch", "gz_sim.launch.py")),
+        launch_arguments={
+            "gz_args" : PythonExpression(["'", world_file, " -r'"])
+
+        }.items()
+    )
+
+    spawn_bcr_bot_node = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(bcr_bot_path, "launch", "bcr_bot_gz_spawn.launch.py")),
+        launch_arguments={
+            # Pass any arguments if your spawn.launch.py requires
+        }.items()
+    )
+
+    return LaunchDescription([
+
+        AppendEnvironmentVariable(
+        name='GZ_SIM_RESOURCE_PATH',
+        value=join(bcr_bot_path, "worlds")),
+
+        AppendEnvironmentVariable(
+        name='GZ_SIM_RESOURCE_PATH',
+        value=join(bcr_bot_path, "models")),
+
+        DeclareLaunchArgument("use_sim_time", default_value=use_sim_time),
+        DeclareLaunchArgument("world_file", default_value=world_file),
+        
+        gz_sim, spawn_bcr_bot_node
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\ign.launch.py ================
+
+#!/usr/bin/python3
+
+from os.path import join
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.substitutions import LaunchConfiguration,PythonExpression
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from ament_index_python.packages import get_package_share_directory
+from launch.actions import AppendEnvironmentVariable
+
+
+def generate_launch_description():
+    use_sim_time = LaunchConfiguration("use_sim_time", default=True)
+
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+    world_file = LaunchConfiguration("world_file", default = join(bcr_bot_path, "worlds", "small_warehouse.sdf"))
+    gz_sim_share = get_package_share_directory("ros_gz_sim")
+
+    gz_sim = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(gz_sim_share, "launch", "gz_sim.launch.py")),
+        launch_arguments={
+            "gz_args" : PythonExpression(["'", world_file, " -r'"])
+
+        }.items()
+    )
+
+    spawn_bcr_bot_node = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(bcr_bot_path, "launch", "bcr_bot_ign_spawn.launch.py")),
+        launch_arguments={
+            # Pass any arguments if your spawn.launch.py requires
+        }.items()
+    )
+
+    return LaunchDescription([
+
+        AppendEnvironmentVariable(
+        name='IGN_GAZEBO_RESOURCE_PATH',
+        value=join(bcr_bot_path, "worlds")),
+
+        AppendEnvironmentVariable(
+        name='IGN_GAZEBO_RESOURCE_PATH',
+        value=join(bcr_bot_path, "models")),
+
+        DeclareLaunchArgument("use_sim_time", default_value=use_sim_time),
+        DeclareLaunchArgument("world_file", default_value=world_file),
+        
+        gz_sim, spawn_bcr_bot_node
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\mapping.launch.py ================
+
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    pkg_slam_toolbox_dir = get_package_share_directory('slam_toolbox')
+    pkg_bcr = get_package_share_directory('bcr_bot')
+
+    # Declare launch arguments
+    use_sim_time = LaunchConfiguration('use_sim_time', default='True')
+    autostart = LaunchConfiguration('autostart', default='True')
+
+    declare_use_sim_time = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='true',
+        description='Use simulation (Gazebo) clock if true'
+    )
+
+    declare_autostart = DeclareLaunchArgument(
+        'autostart',
+        default_value='true',
+        description='Automatically start the slam_toolbox stack'
+    )
+
+    # Include slam_toolbox launch file
+    slam_toolbox_launch_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_slam_toolbox_dir, 'launch', 'online_async_launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'slam_params_file': os.path.join(pkg_bcr, 'config', 'mapper_params_online_async.yaml'),
+        }.items()
+    )
+
+    # Launch RViz
+    rviz_launch_cmd = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        arguments=[
+            '-d', os.path.join(pkg_bcr, 'rviz', 'map.rviz')
+        ]
+    )
+
+    # Static transform publisher
+    static_transform_publisher_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='map_to_odom',
+        output='screen',
+        arguments=['0', '0', '0', '0', '0', '0', 'map', 'odom']
+    )
+
+    # Create launch description and add actions
+    ld = LaunchDescription()
+
+    ld.add_action(declare_use_sim_time)
+    ld.add_action(declare_autostart)
+    ld.add_action(slam_toolbox_launch_cmd)
+    ld.add_action(rviz_launch_cmd)
+    ld.add_action(static_transform_publisher_node)
+
+    return ld
+
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\nav2.launch.py ================
+
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    pkg_nav2_dir = get_package_share_directory('nav2_bringup')
+    pkg_bcr = get_package_share_directory('bcr_bot')
+
+    use_sim_time = LaunchConfiguration('use_sim_time', default='True')
+    autostart = LaunchConfiguration('autostart', default='True')
+
+    nav2_launch_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_nav2_dir, 'launch', 'bringup_launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'autostart': autostart,
+            'map': os.path.join(pkg_bcr, 'config', 'bcr_map.yaml'),
+            'params_file': os.path.join(pkg_bcr, 'config', 'nav2_params.yaml'),
+            'package_path': pkg_bcr, 
+        }.items()
+    )
+
+    rviz_launch_cmd = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        arguments=[
+            '-d' + os.path.join(
+                get_package_share_directory('nav2_bringup'),
+                'rviz',
+                'nav2_default_view.rviz'
+            )
+        ]
+    )
+    
+    amcl_node = Node(
+        package='nav2_amcl',
+        executable='amcl',
+        name='amcl',
+        output='screen',
+        parameters=[os.path.join(pkg_bcr, 'config', 'amcl_params.yaml')],
+    )
+
+    map_server_node = Node(
+        package='nav2_map_server',
+        executable='map_server',
+        name='map_server',
+        output='screen',
+        parameters=[{'yaml_filename': os.path.join(pkg_bcr, 'config', 'bcr_map.yaml')}],
+    )
+
+    static_transform_publisher_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='map_to_odom',
+        output='screen',
+        arguments=['0', '0', '0', '0', '0', '0', 'map', 'odom']
+    )
+
+    remapper_node = Node(
+        package='bcr_bot',
+        executable='remapper.py',
+        name='remapper',
+        output='screen',
+    )
+
+    ld = LaunchDescription()
+
+    ld.add_action(nav2_launch_cmd)
+    ld.add_action(rviz_launch_cmd)
+    ld.add_action(amcl_node)
+    ld.add_action(map_server_node)
+    ld.add_action(static_transform_publisher_node)
+    ld.add_action(remapper_node)
+
+    return ld
+
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\rviz.launch.py ================
+
+#!/usr/bin/env python3
+import os
+import xacro
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument, GroupAction
+from launch.conditions import IfCondition, UnlessCondition
+
+def get_xacro_to_doc(xacro_file_path, mappings):
+    doc = xacro.parse(open(xacro_file_path))
+    xacro.process_doc(doc, mappings=mappings)
+    return doc
+
+def generate_launch_description():
+    # Launch configurations
+    use_sim_time = LaunchConfiguration('use_sim_time', default='false')
+    isaac_sim = LaunchConfiguration('isaac_sim')
+
+    # Process XACRO
+    xacro_path = os.path.join(get_package_share_directory('bcr_bot'), 'urdf', 'bcr_bot.xacro')
+    doc = get_xacro_to_doc(xacro_path, {"wheel_odom_topic": "odom"})
+
+    # Nodes
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}, {'robot_description': doc.toxml()}],
+        condition=UnlessCondition(isaac_sim)  # Only start if isaac_sim is false
+    )
+
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        output='screen',
+        arguments=['-d', os.path.join(get_package_share_directory('bcr_bot'), 'rviz', 'entire_setup.rviz')]
+    )
+
+    return LaunchDescription([
+        # Declare arguments
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='false',
+            description='Use simulation time if true'
+        ),
+        DeclareLaunchArgument(
+            'isaac_sim',
+            default_value='false',
+            description='Set to true when using Isaac Sim'
+        ),
+        DeclareLaunchArgument(
+            'robot_description',
+            default_value=doc.toxml(),
+            description='Robot description in URDF/XACRO format'
+        ),
+        # Nodes
+        robot_state_publisher,
+        rviz
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\launch\world_bringup.launch.py ================
+
+#!/usr/bin/python3
+
+from os.path import join
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, AppendEnvironmentVariable
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from ament_index_python.packages import get_package_share_directory
+
+
+def generate_launch_description():
+    use_sim_time = LaunchConfiguration("use_sim_time", default=True)
+
+    bcr_bot_path = get_package_share_directory("bcr_bot")
+    world_file = LaunchConfiguration("world_file", default=join(bcr_bot_path, "worlds", "small_warehouse.sdf"))
+    gz_sim_share = get_package_share_directory("ros_gz_sim")
+
+    gz_sim = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(join(gz_sim_share, "launch", "gz_sim.launch.py")),
+        launch_arguments={
+            "gz_args": PythonExpression(["'", world_file, " -r'"])
+        }.items()
+    )
+
+    return LaunchDescription([
+        AppendEnvironmentVariable(
+            name='GZ_SIM_RESOURCE_PATH',
+            value=join(bcr_bot_path, "worlds")),
+
+        AppendEnvironmentVariable(
+            name='GZ_SIM_RESOURCE_PATH',
+            value=join(bcr_bot_path, "models")),
+
+        DeclareLaunchArgument("use_sim_time", default_value=use_sim_time),
+        DeclareLaunchArgument("world_file", default_value=world_file),
+
+        gz_sim
+    ])
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\src\bcr_bot\scripts\remapper.py ================
+
+#! /usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, QoSDurabilityPolicy
+from geometry_msgs.msg import Twist
+
+class CmdVelRemapper(Node):
+    def __init__(self):
+        super().__init__('cmd_vel_remapper')
+
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=10
+        )
+
+        # Create a subscriber for the cmd_vel topic
+        self.subscription = self.create_subscription(
+            Twist,
+            'cmd_vel',
+            self.cmd_vel_callback,
+            qos_profile
+        )
+        self.subscription  # Prevent unused variable warning
+
+        # Create a publisher for the bcr_bot/cmd_vel topic
+        self.publisher = self.create_publisher(Twist, 'bcr_bot/cmd_vel', qos_profile)
+
+    def cmd_vel_callback(self, msg):
+        # Republish the received message to bcr_bot/cmd_vel
+        self.publisher.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    cmd_vel_remapper = CmdVelRemapper()
+
+    try:
+        rclpy.spin(cmd_vel_remapper)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cmd_vel_remapper.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+
+================ FILE: E:\Others\Hackathons\SIH'26\amr-fleet-coordination\tests\test_core.py ================
+
+import unittest
+
+from arcnet_core import (
+    RobotSpec,
+    Footprint,
+    SafetyConfig,
+    SafetyLevel,
+    Grid,
+    Obstacle,
+    PathPlanner,
+    RobotIntent,
+    ConflictArbiter,
+    WaitForGraph,
+    LivenessConfig,
+    Peer,
+    PeerManager,
+    MotionController,
+    PeerStatus
+)
+
+from arcnet_core.safety import (
+    hard_stop_distance,
+    get_safety_level
+)
+
+
+class TestCore(unittest.TestCase):
+
+
+    def robot(self):
+        return RobotSpec(
+            id="R1",
+            shape="rectangle",
+            length=0.9,
+            width=0.64,
+            height=0.19,
+            mass=70,
+            wheel_track=0.6,
+            wheel_radius=0.1,
+            max_speed=1.0,
+            acceleration=0.5,
+            braking=1.0,
+            safety_margin=0.1
+        )
+
+    def test_robot(self):
+        r = self.robot()
+        r.validate()
+
+        self.assertGreater(r.radius, 0)
+        self.assertEqual(r.braking_distance, 0.5)
+
+    def test_footprint(self):
+        r = self.robot()
+        f = Footprint.from_robot(r)
+
+        self.assertEqual(f.length, r.length)
+        self.assertEqual(f.width, r.width)
+
+    def test_safety(self):
+        r = self.robot()
+        s = SafetyConfig(0.1, 0.1)
+
+        d = hard_stop_distance(r, s)
+
+        self.assertGreater(d, 0)
+
+        self.assertEqual(
+            get_safety_level(d, r, s),
+            SafetyLevel.HARD_STOP
+        )
+
+    def test_grid_and_planner(self):
+        g = Grid(10, 10, 1.0)
+        obstacles = [Obstacle(2, 1)]
+
+        p = PathPlanner().plan(
+            (0, 1),
+            (4, 1),
+            obstacles,
+            g
+        )
+
+        self.assertTrue(p)
+        self.assertNotIn((2, 1), p)
+
+    def test_predictive_planner(self):
+        g = Grid(10, 10, 1.0)
+
+        peer_paths = {
+            "R2": [
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (2, 3)
+            ]
+        }
+
+        p = PathPlanner().plan_predictive(
+            (0, 1),
+            (4, 1),
+            [],
+            g,
+            peer_paths
+        )
+
+        self.assertTrue(p)
+
+    def test_arbiter(self):
+        a = RobotIntent(
+            "R1",
+            1,
+            2.0,
+            0,
+            0,
+            0,
+            0,
+            0
+        )
+
+        b = RobotIntent(
+            "R2",
+            2,
+            1.0,
+            0,
+            0,
+            0,
+            0,
+            0
+        )
+
+        winner = ConflictArbiter().decide(a, b)
+
+        self.assertEqual(winner.id, "R1")
+
+    def test_deadlock(self):
+        g = WaitForGraph()
+
+        g.add_wait("R1", "R2")
+        g.add_wait("R2", "R3")
+        g.add_wait("R3", "R1")
+
+        self.assertTrue(g.has_deadlock())
+
+        self.assertEqual(
+            set(g.get_cycle()),
+            {"R1", "R2", "R3"}
+        )
+
+    def test_deadlock_victim(self):
+        g = WaitForGraph()
+
+        g.add_wait("R1", "R2")
+        g.add_wait("R2", "R3")
+        g.add_wait("R3", "R1")
+
+        a = RobotIntent("R1", 1, 5, 0, 0, 0, 0, 0)
+        b = RobotIntent("R2", 2, 1, 0, 0, 0, 0, 0)
+        c = RobotIntent("R3", 3, 2, 0, 0, 0, 0, 0)
+
+        victim = g.choose_victim(
+            [a, b, c],
+            ConflictArbiter()
+        )
+
+        self.assertEqual(victim.id, "R2")
+
+    def test_peer_manager(self):
+        config = LivenessConfig(
+            warning_timeout=1.0,
+            failure_timeout=3.0
+        )
+
+        manager = PeerManager(config)
+
+        peer = Peer(
+            "R2",
+            2,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0
+        )
+
+        manager.add(peer)
+
+        status = manager.update(
+            "R2",
+            0.5,
+            True,
+            True
+        )
+
+        self.assertEqual(
+            status,
+            PeerStatus.ACTIVE
+        )
+
+    def test_motion(self):
+        m = MotionController()
+
+        normal = m.command(
+            SafetyLevel.NORMAL,
+            1.0,
+            0.0
+        )
+
+        caution = m.command(
+            SafetyLevel.CAUTION,
+            1.0,
+            0.0
+        )
+
+        stop = m.command(
+            SafetyLevel.HARD_STOP,
+            1.0,
+            0.0
+        )
+
+        self.assertEqual(normal.vx, 1.0)
+        self.assertEqual(caution.vx, 0.5)
+        self.assertTrue(stop.stop)
+        self.assertEqual(stop.vx, 0.0)
+
+
+    def test_conflict_detector(self):
+        from arcnet_core import ConflictDetector
+
+        detector = ConflictDetector()
+
+        path = [
+         (0, 0),
+         (1, 0),
+         (2, 0)
+        ]
+
+        peers = {
+            "R2": [
+            (3, 0),
+            (1, 0),
+            (2, 1)
+            ]
+        }
+
+        conflicts = detector.detect(
+            "R1",
+            path,
+            peers
+        )
+
+        self.assertTrue(conflicts)
+        self.assertEqual(conflicts[0].kind, "vertex")
+
+    def test_engine_safety(self):
+        from arcnet_core import ArcnetEngine
+
+        r = self.robot()
+
+        grid = Grid(
+            10,
+            10,
+            1.0
+        )
+
+        engine = ArcnetEngine(
+            {"R1": r},
+            grid,
+            [],
+            SafetyConfig(0.1, 0.1)
+        )
+
+        level, command = engine.command_for_distance(
+            "R1",
+            0.1,
+            1.0,
+            0.0
+        )
+
+        self.assertEqual(
+            level,
+            SafetyLevel.HARD_STOP
+        )
+
+        self.assertTrue(
+            command.stop
+        )
+
+    def test_surface_gap(self):
+        from arcnet_core import Footprint
+        from arcnet_core.geometry import surface_gap
+
+        a = Footprint("circle", 1.0, 1.0)
+        b = Footprint("circle", 1.0, 1.0)
+
+        self.assertEqual(
+            surface_gap(
+                (0, 0),
+                (3, 0),
+                a,
+                b
+            ),
+            2.0
+        )
+
+
+    def test_surface_overlap(self):
+        from arcnet_core import Footprint
+        from arcnet_core.geometry import surface_gap
+
+        a = Footprint("circle", 1.0, 1.0)
+        b = Footprint("circle", 1.0, 1.0)
+
+        self.assertEqual(
+            surface_gap(
+                (0, 0),
+                (1, 0),
+                a,
+                b
+            ),
+            0.0
+        )
+
+
+    def test_uncertainty_radius(self):
+        from arcnet_core import Peer, PeerManager, LivenessConfig
+
+        manager = PeerManager(
+            LivenessConfig(
+                warning_timeout=1.0,
+                failure_timeout=3.0,
+                margin=0.1
+            )
+        )
+
+        peer = Peer(
+            id="R2",
+            x=5.0,
+            y=5.0,
+            vx=1.0,
+            vy=0.0,
+            theta=0.0,
+            last_local_broadcast=0.0,
+            last_global_heartbeat=0.0,
+            max_speed=2.0
+        )
+
+        manager.add(peer)
+
+        radius = manager.uncertainty_radius(
+            "R2",
+            2.0
+        )
+
+        self.assertAlmostEqual(
+            radius,
+            4.1
+        )
+
+
+    def test_peer_failure(self):
+        from arcnet_core import Peer, PeerManager, LivenessConfig
+        from arcnet_core.peer import PeerStatus
+
+        manager = PeerManager(
+            LivenessConfig(
+                warning_timeout=1.0,
+                failure_timeout=3.0,
+                margin=0.1
+            )
+        )
+
+        peer = Peer(
+            id="R2",
+            x=5.0,
+            y=5.0,
+            vx=0.0,
+            vy=0.0,
+            theta=0.0,
+            last_local_broadcast=0.0,
+            last_global_heartbeat=0.0
+        )
+
+        manager.add(peer)
+
+        status = manager.update(
+            "R2",
+            4.0,
+            False,
+            False
+        )
+
+        self.assertEqual(
+            status,
+            PeerStatus.PRESUMED_FAILED
+        )
+
+
+
+    def test_cell_neighbors(self):
+        from arcnet_core import Cell
+
+        cell = Cell(2, 3)
+
+        neighbors = cell.neighbors()
+
+        self.assertEqual(len(neighbors), 9)
+        self.assertIn(Cell(2, 3), neighbors)
+        self.assertIn(Cell(1, 2), neighbors)
+        self.assertIn(Cell(3, 4), neighbors)
+
+
+    def test_cell_position(self):
+        from arcnet_core import SpatialManager
+
+        manager = SpatialManager(10.0)
+
+        cell = manager.get_cell(
+            25.0,
+            35.0
+        )
+
+        self.assertEqual(
+            cell.x,
+            2
+        )
+
+        self.assertEqual(
+            cell.y,
+            3
+        )
+
+
+    def test_cell_change(self):
+        from arcnet_core import SpatialManager
+
+        manager = SpatialManager(10.0)
+
+        event = manager.set_robot_position(
+            "R1",
+            5.0,
+            5.0
+        )
+
+        self.assertEqual(
+            event["event"],
+            "CELL_ENTER"
+        )
+
+        event = manager.set_robot_position(
+            "R1",
+            15.0,
+            5.0
+        )
+
+        self.assertEqual(
+            event["event"],
+            "CELL_CHANGE"
+        )
+
+        self.assertEqual(
+            event["old_cell"].x,
+            0
+        )
+
+        self.assertEqual(
+            event["new_cell"].x,
+            1
+        )
+
+
+    def test_spatial_subscriptions(self):
+        from arcnet_core import SpatialManager
+
+        manager = SpatialManager(10.0)
+
+        manager.set_robot_position(
+            "R1",
+            25.0,
+            35.0
+        )
+
+        cells = manager.get_subscriptions("R1")
+
+        self.assertEqual(
+            len(cells),
+            9
+        )
+
+    def test_local_avoidance(self):
+        from arcnet_core.avoidance import LocalAvoidance
+
+        avoidance = LocalAvoidance()
+
+        result = avoidance.avoid(
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            [
+                {
+                    "x": 2.0,
+                    "y": 0.0,
+                    "vx": -1.0,
+                    "vy": 0.0
+                }
+            ]
+        )
+
+        self.assertTrue(result.changed)
+
+        self.assertNotEqual(
+            result.vy,
+            0.0
+        )
+
+
+    def test_local_avoidance_no_conflict(self):
+        from arcnet_core.avoidance import LocalAvoidance
+
+        avoidance = LocalAvoidance()
+
+        result = avoidance.avoid(
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            [
+                {
+                    "x": 10.0,
+                    "y": 10.0,
+                    "vx": 0.0,
+                    "vy": 0.0
+                }
+            ]
+        )
+
+        self.assertFalse(result.changed)
+
+        self.assertEqual(
+            result.vx,
+            1.0
+        )
+
+        self.assertEqual(
+            result.vy,
+            0.0
+        )
+
+
+    def test_engine_avoidance(self):
+        from arcnet_core import (
+            ArcnetEngine,
+            RobotSpec,
+            Grid,
+            SafetyConfig
+        )
+
+        r1 = RobotSpec(
+            "R1",
+            "circle",
+            1.0,
+            1.0,
+            0.5,
+            10.0,
+            0.5,
+            0.1,
+            1.0,
+            1.0,
+            1.0,
+            0.1
+        )
+
+        engine = ArcnetEngine(
+            {"R1": r1},
+            Grid(10, 10, 1.0),
+            [],
+            SafetyConfig()
+        )
+
+        engine.set_peer_state(
+            "R2",
+            1.5,
+            0.0,
+            -1.0,
+            0.0
+        )
+
+        level, command = engine.command_for_distance(
+            "R1",
+            1.5,
+            1.0,
+            0.0
+        )
+
+        self.assertNotEqual(
+            command.vy,
+            0.0
+        )
+
+    def test_simulator(self):
+        from arcnet_core import (
+            WarehouseSimulator,
+            Grid,
+            RobotSpec
+        )
+
+        robot = RobotSpec(
+            "R1",
+            "circle",
+            1.0,
+            1.0,
+            0.5,
+            10.0,
+            0.5,
+            0.1,
+            1.0,
+            1.0,
+            1.0,
+            0.1
+        )
+
+        sim = WarehouseSimulator(
+            Grid(10, 10, 1.0),
+            [],
+            {"R1": robot}
+        )
+
+        sim.add_robot(
+            "R1",
+            1.0,
+            1.0
+        )
+
+        from arcnet_core.motion import MotionCommand
+
+        sim.step({
+            "R1": MotionCommand(
+                1.0,
+                0.0,
+                0.0
+            )
+        })
+
+        r = sim.get_robot("R1")
+
+        self.assertAlmostEqual(
+            r.x,
+            1.1
+        )
+
+        self.assertAlmostEqual(
+            r.y,
+            1.0
+        )
+
+
+    def test_kill_robot(self):
+        from arcnet_core import (
+            WarehouseSimulator,
+            Grid,
+            RobotSpec
+        )
+
+        robot = RobotSpec(
+            "R1",
+            "circle",
+            1.0,
+            1.0,
+            0.5,
+            10.0,
+            0.5,
+            0.1,
+            1.0,
+            1.0,
+            1.0,
+            0.1
+        )
+
+        sim = WarehouseSimulator(
+            Grid(10, 10, 1.0),
+            [],
+            {"R1": robot}
+        )
+
+        sim.add_robot(
+            "R1",
+            1.0,
+            1.0
+        )
+
+        sim.kill_robot("R1")
+
+        r = sim.get_robot("R1")
+
+        self.assertFalse(r.active)
+        self.assertEqual(r.vx, 0.0)
+        self.assertEqual(r.vy, 0.0)
+
+    def test_fleet_runner(self):
+        from arcnet_core import (
+            WarehouseSimulator,
+            Grid,
+            RobotSpec,
+            Task,
+            ArcnetEngine,
+            SafetyConfig,
+            FleetRunner
+        )
+
+        robot = RobotSpec(
+            "R1",
+            "circle",
+            1.0,
+            1.0,
+            0.5,
+            10.0,
+            0.5,
+            0.1,
+            1.0,
+            1.0,
+            1.0,
+            0.1
+        )
+
+        grid = Grid(
+            10,
+            10,
+            1.0
+        )
+
+        sim = WarehouseSimulator(
+            grid,
+            [],
+            {"R1": robot}
+        )
+
+        sim.add_robot(
+            "R1",
+            0.5,
+            0.5
+        )
+
+        task = Task(
+            "T1",
+            (0, 0),
+            (2, 0),
+            "R1"
+        )
+
+        sim.add_task(task)
+
+        engine = ArcnetEngine(
+            {"R1": robot},
+            grid,
+            [],
+            SafetyConfig()
+        )
+
+        runner = FleetRunner(
+            sim,
+            engine
+        )
+
+        metrics = runner.run(
+            max_steps=100
+        )
+
+        self.assertEqual(
+            metrics.tasks_completed,
+            1
+        )
+
+
+    def test_scenario_runner(self):
+        from arcnet_core import (
+            WarehouseSimulator,
+            Grid,
+            RobotSpec,
+            ArcnetEngine,
+            SafetyConfig,
+            Scenario,
+            ScenarioRunner
+        )
+
+        robot = RobotSpec(
+            "R1",
+            "circle",
+            1.0,
+            1.0,
+            0.5,
+            10.0,
+            0.5,
+            0.1,
+            1.0,
+            1.0,
+            1.0,
+            0.1
+        )
+
+        grid = Grid(10, 10, 1.0)
+
+        sim = WarehouseSimulator(
+            grid,
+            [],
+            {"R1": robot}
+        )
+
+        engine = ArcnetEngine(
+            {"R1": robot},
+            grid,
+            sim.obstacles,
+            SafetyConfig()
+        )
+
+        runner = ScenarioRunner(
+            sim,
+            engine
+        )
+
+        scenario = Scenario(
+            "S1",
+            "Test",
+            "Basic scenario",
+            [],
+            [
+                {
+                    "id": "R1",
+                    "x": 1.0,
+                    "y": 1.0
+                }
+            ],
+            []
+        )
+
+        runner.load(scenario)
+
+        self.assertIn(
+            "R1",
+            sim.robots
+        )
+
+
+    def test_scenario_library(self):
+        from arcnet_core import ScenarioLibrary
+
+        library = ScenarioLibrary()
+
+        scenarios = library.all()
+
+        self.assertEqual(
+            len(scenarios),
+            8
+        )
+
+        scenario = library.get(
+            "head_on"
+        )
+
+        self.assertEqual(
+            scenario["id"],
+            "head_on"
+        )
+
+        self.assertEqual(
+            len(scenario["robots"]),
+            2
+        )
+
+
+    def test_fault_manager(self):
+        from arcnet_core import FaultManager
+
+        manager = FaultManager()
+
+        manager.kill_robot("R2")
+
+        self.assertIn(
+            "R2",
+            manager.failed_robots()
+        )
+
+        manager.wifi_dead_zone(
+            2,
+            3
+        )
+
+        self.assertTrue(
+            manager.is_wifi_blocked(
+                2,
+                3
+            )
+        )
+
+        manager.blocked_cell(
+            4,
+            5
+        )
+
+        self.assertIn(
+            (4, 5),
+            manager.blocked_cells()
+        )
+
+
+    def test_task_lifecycle(self):
+        from arcnet_core import Task, TaskStatus
+
+        task = Task(
+            "T1",
+            (0, 0),
+            (2, 2),
+            "R1"
+        )
+
+        self.assertEqual(
+            task.status,
+            TaskStatus.PENDING
+        )
+
+        task.activate()
+
+        self.assertEqual(
+            task.status,
+            TaskStatus.ACTIVE
+        )
+
+        task.complete()
+
+        self.assertEqual(
+            task.status,
+            TaskStatus.COMPLETED
+        )
+
+
+
+if __name__ == "__main__":
+    unittest.main()
